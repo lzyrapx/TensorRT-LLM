@@ -15,7 +15,7 @@
 from ..functional import softplus, tanh
 from ..module import Module
 
-
+# 没啥用，几乎用不到
 class Mish(Module):
 
     def forward(self, input):

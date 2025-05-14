@@ -1,17 +1,41 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+提供了多种注意力机制的参数配置和计算实现，支持不同模型架构的定制化需求，并通过 TensorRT 的优化能力提升推理性能。
+
+代码里实现了多个类，类说明如下：attention 是基类
+
+AttentionMaskParams
+管理注意力掩码的配置参数（如序列长度、掩码类型），用于屏蔽无效位置（如填充符或未来位置）。
+
+AttentionParams
+定义通用注意力机制的参数，包括头数（num_heads）、头维度（head_size）、是否使用 RoPE（旋转位置编码）等。
+
+SpecDecodingParams
+配置推测式解码（Speculative Decoding）的参数，用于加速自回归生成（如动态调整候选序列长度）。
+
+MropeParams
+可能与混合旋转位置编码（Mixed RoPE）相关的配置，支持动态调整位置编码的插值或扩展策略。
+
+KeyValueCacheParams
+管理键值缓存（KV Cache）的参数，用于优化自回归生成时的重复计算（如缓存长度、分块策略）。
+
+BlockSparseAttnParams
+配置块稀疏注意力的参数，减少长序列的计算量（如定义稀疏块的大小和模式）。
+
+Attention（基类）
+实现标准的 Transformer 注意力机制（Multi-Head Attention），包含 QKV 投影、Softmax、Context 计算等。
+
+BertAttention
+BERT 专用的注意力模块，支持双向注意力，通常用于编码器结构。
+
+CogVLMAttention
+为 CogVLM 模型定制的注意力模块，可能集成视觉-语言交叉注意力或其他扩展功能。
+
+DeepseekV2Attention
+针对 Deepseek V2 模型的优化注意力实现，可能包含稀疏注意力或硬件适配优化。
+
+DiffusersAttention
+与扩散模型（Diffusion Models）结合的注意力模块，支持多步去噪过程中的特征交互。
+"""
 import math
 from typing import List, Optional
 
@@ -41,6 +65,7 @@ from .linear import ColumnLinear, RowLinear
 from .lora import LoraRuntimeParams
 from .normalization import GroupNorm, LayerNorm, RmsNorm
 
+# 多种 norm
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
     LayerNormType.RmsNorm: RmsNorm,
@@ -132,20 +157,109 @@ def compute_relative_bias(query_length,
 
 
 class AttentionMaskParams(object):
-
+    """ 管理注意力机制中的各类掩码参数，用于控制注意力计算的有效位置
+    
+    该类封装了自注意力（Self-Attention）和交叉注意力（Cross-Attention）所需的掩码，
+    支持普通掩码和打包掩码（Packed Mask）两种形式，适用于Transformer类模型的训练和推理场景。
+    
+    属性:
+        self_attention_mask (Tensor, optional): 
+            标准自注意力掩码张量，形状通常为 [batch_size, seq_len] 或 [batch_size, 1, seq_len, seq_len]。
+            用于屏蔽无效位置（如填充符或未来位置）。
+            
+        self_attention_packed_mask (Tensor, optional): 
+            打包格式的自注意力掩码，适用于将多个序列拼接为单个张量的高效处理场景。
+            形状可能为 [total_tokens]，其中 total_tokens 是批量中所有序列的总长度。
+            
+        cross_attention_mask (Tensor, optional): 
+            标准交叉注意力掩码张量，形状通常为 [batch_size, src_seq_len] 或 [batch_size, 1, tgt_seq_len, src_seq_len]。
+            用于控制解码器对编码器输出的注意力范围。
+            
+        cross_attention_packed_mask (Tensor, optional): 
+            打包格式的交叉注意力掩码，适用于编码器-解码器结构中的批量处理优化。
+    
+    示例:
+        >>> # 自注意力掩码（屏蔽未来位置）
+        >>> mask = torch.tril(torch.ones(seq_len, seq_len)).bool()
+        >>> params = AttentionMaskParams(self_attention_mask=mask)
+        
+        >>> # 交叉注意力掩码（限制解码器只能关注编码器有效位置）
+        >>> cross_mask = encoder_outputs.attention_mask.unsqueeze(1)  # [batch, 1, src_len]
+        >>> params = AttentionMaskParams(cross_attention_mask=cross_mask)
+    """
     def __init__(self,
                  self_attention_mask: Tensor = None,
                  self_attention_packed_mask: Tensor = None,
                  cross_attention_mask: Tensor = None,
                  cross_attention_packed_mask: Tensor = None):
-        self.self_attention_mask = self_attention_mask
-        self.self_attention_packed_mask = self_attention_packed_mask
-        self.cross_attention_mask = cross_attention_mask
-        self.cross_attention_packed_mask = cross_attention_packed_mask
+        # 初始化各掩码参数
+        self.self_attention_mask = self_attention_mask  # 自注意力掩码
+        self.self_attention_packed_mask = self_attention_packed_mask  # 打包自注意力掩码（高效批量处理）
+        self.cross_attention_mask = cross_attention_mask # 交叉注意力掩码
+        self.cross_attention_packed_mask = cross_attention_packed_mask  # 打包交叉注意力掩码
 
 
 class AttentionParams(object):
+    """ 管理注意力机制的核心参数配置，支持多种注意力变体和运行时优化
+    
+    该类封装了通用注意力计算所需的动态参数和预计算常量参数，包含序列长度管理、RoPE（旋转位置编码）配置、
+    交叉注意力校验等逻辑，适配Transformer类模型在TensorRT-LLM框架下的高效推理需求。
 
+    属性:
+        sequence_length (Tensor, optional): 
+            当前批次的序列长度张量，形状为 [batch_size]，用于动态调整注意力计算范围。
+            
+        context_lengths (Tensor, optional): 
+            每个序列的有效上下文长度（不含填充），形状为 [batch_size]，用于KV Cache管理。
+            
+        host_context_lengths (Tensor, optional): 
+            Host内存中的上下文长度张量，用于去除输入填充（remove_input_padding）时的优化操作。
+            
+        max_context_length (int, optional): 
+            当前批次的最大上下文长度，用于预计算内存分配（如Scratch Memory）。
+            
+        host_request_types (Tensor, optional): 
+            请求类型标识（如0=上下文阶段，1=生成阶段），形状为 [batch_size]，用于动态切换计算模式。
+            
+        encoder_input_lengths (Tensor, optional): 
+            编码器输入长度（交叉注意力场景），形状为 [batch_size]，校验交叉注意力是否有效。
+            
+        encoder_max_input_length (Tensor, optional): 
+            编码器最大输入长度，用于交叉注意力的内存预分配。
+            
+        host_runtime_perf_knobs (Tensor, optional): 
+            运行时性能调优参数（如并行度配置），通常由框架自动设置。
+            
+        host_context_progress (Tensor, optional): 
+            上下文生成进度跟踪，用于动态解码控制。
+        
+        # RoPE相关预计算参数
+        embed_positions (Tensor, optional): 
+            RoPE的位置编码基础张量，形状通常为 [max_seq_len, head_dim]。
+            
+        rotary_inv_freq (Tensor, optional): 
+            RoPE的旋转频率倒数张量，形状为 [head_dim / 2]。
+            
+        embed_positions_for_gpt_attention (Tensor, optional): 
+            GPT类模型专用的扩展位置编码参数。
+            
+        # 异构注意力层支持（如Gemma3）
+        embed_positions_local (Tensor, optional): 
+            局部RoPE位置编码（适配不同层的定制需求）。
+            
+        # 长上下文RoPE扩展参数
+        long_rope_embed_positions (Tensor, optional): 
+            长序列专用的RoPE位置编码，支持扩展上下文长度。
+            
+        short_mscale/long_mscale (float): 
+            RoPE缩放因子，分别用于短序列和长序列的旋转幅度调节。
+
+    方法:
+        fill_attention_const_params_for_rope: 注入标准RoPE预计算参数
+        fill_attention_const_params_for_long_rope: 注入长上下文RoPE扩展参数
+        is_valid_cross_attn: 校验交叉注意力参数是否有效
+        is_valid: 全局参数校验（依赖GPT Attention插件和运行模式）
+    """
     def __init__(self,
                  sequence_length: Tensor = None,
                  context_lengths: Tensor = None,
@@ -156,38 +270,43 @@ class AttentionParams(object):
                  encoder_max_input_length: Tensor = None,
                  host_runtime_perf_knobs: Tensor = None,
                  host_context_progress: Tensor = None):
-        self.sequence_length = sequence_length
-        self.context_lengths = context_lengths
-        self.host_context_lengths = host_context_lengths
+        # 动态运行时参数
+        self.sequence_length = sequence_length  # 当前序列长度（每个样本）
+        self.context_lengths = context_lengths  # 有效上下文长度（去填充）
+        self.host_context_lengths = host_context_lengths # Host端上下文长度（优化用）
         # max allowed context length. Required to
         # compute scratch memory size.
-        self.max_context_length = max_context_length
-        self.host_request_types = host_request_types
+        self.max_context_length = max_context_length # 最大上下文长度（内存预分配）
+        self.host_request_types = host_request_types # 请求阶段标识（上下文/生成）
 
-        self.encoder_input_lengths = encoder_input_lengths
-        self.encoder_max_input_length = encoder_max_input_length
+        # 交叉注意力相关参数
+        self.encoder_input_lengths = encoder_input_lengths # 编码器输入长度
+        self.encoder_max_input_length = encoder_max_input_length  # 编码器最大长度
 
-        self.host_runtime_perf_knobs = host_runtime_perf_knobs
-
-        self.host_context_progress = host_context_progress
+        # 性能调优参数
+        self.host_runtime_perf_knobs = host_runtime_perf_knobs # 运行时性能调优开关
+        self.host_context_progress = host_context_progress  # 生成进度跟踪
 
         # const parameters that will be reused by all layers.
-        self.embed_positions = None
-        self.rotary_inv_freq = None
-        self.embed_positions_for_gpt_attention = None
+        # RoPE预计算参数（标准）
+        self.embed_positions = None            # 基础位置编码
+        self.rotary_inv_freq = None            # 旋转频率倒数
+        self.embed_positions_for_gpt_attention = None  # GPT扩展位置编码
 
         # auxiliary params to support models with non-homegeneous attn layers requiring
         # a different set of rope params. e.g. Gemma3.
-        self.embed_positions_local = None
-        self.rotary_inv_freq_local = None
+        # 异构注意力层支持（如不同层使用不同的RoPE参数）
+        self.embed_positions_local = None      # 局部位置编码
+        self.rotary_inv_freq_local = None      # 局部旋转频率
         self.embed_positions_for_gpt_attention_local = None
 
         # long rope const parameters
-        self.long_rope_embed_positions = None
-        self.long_rope_rotary_inv_freq = None
+        # 长上下文RoPE扩展参数
+        self.long_rope_embed_positions = None              # 长序列位置编码
+        self.long_rope_rotary_inv_freq = None              # 长序列旋转频率
         self.long_rope_embed_positions_for_gpt_attention = None
-        self.short_mscale = 1.0
-        self.long_mscale = 1.0
+        self.short_mscale = 1.0    # 短序列RoPE缩放因子
+        self.long_mscale = 1.0     # 长序列RoPE缩放因子
 
     def fill_attention_const_params_for_rope(
             self,
@@ -197,6 +316,18 @@ class AttentionParams(object):
             embed_positions_local: Tensor = None,
             rotary_inv_freq_local: Tensor = None,
             embed_positions_for_gpt_attention_local: Tensor = None):
+        """注入标准RoPE预计算参数（基础版和局部版）
+        
+        Args:
+            embed_positions: 基础位置编码张量
+            rotary_inv_freq: 基础旋转频率倒数张量
+            embed_positions_for_gpt_attention: GPT专用扩展编码
+            embed_positions_local: 局部位置编码（异构层）
+            rotary_inv_freq_local: 局部旋转频率（异构层）
+            embed_positions_for_gpt_attention_local: 局部GPT扩展编码
+        Returns:
+            self: 支持链式调用
+        """
         self.embed_positions = embed_positions
         self.rotary_inv_freq = rotary_inv_freq
         self.embed_positions_for_gpt_attention = embed_positions_for_gpt_attention
@@ -210,6 +341,20 @@ class AttentionParams(object):
             long_rope_rotary_inv_freq, embed_positions_for_gpt_attention,
             long_rope_embed_positions_for_gpt_attention, short_mscale,
             long_mscale):
+        """注入长上下文RoPE扩展参数（如支持超过训练长度的外推）
+        
+        Args:
+            embed_positions: 标准RoPE位置编码
+            long_rope_embed_positions: 长序列扩展编码
+            rotary_inv_freq: 标准旋转频率
+            long_rope_rotary_inv_freq: 长序列旋转频率
+            embed_positions_for_gpt_attention: 标准GPT扩展编码
+            long_rope_embed_positions_for_gpt_attention: 长序列GPT扩展编码
+            short_mscale: 短序列缩放因子（通常保持1.0）
+            long_mscale: 长序列缩放因子（用于调节注意力衰减）
+        Returns:
+            self: 支持链式调用
+        """
         self.embed_positions = embed_positions
         self.long_rope_embed_positions = long_rope_embed_positions
         self.rotary_inv_freq = rotary_inv_freq
@@ -221,6 +366,13 @@ class AttentionParams(object):
         return self
 
     def is_valid_cross_attn(self, do_cross_attention):
+        """校验交叉注意力参数是否有效（需提供编码器输入长度）
+        
+        Args:
+            do_cross_attention: 是否启用交叉注意力
+        Returns:
+            bool: 参数是否有效
+        """
         if do_cross_attention:
             if self.encoder_input_lengths is None:
                 return False
@@ -230,7 +382,17 @@ class AttentionParams(object):
 
     def is_valid(self, gpt_attention_plugin, remove_input_padding,
                  use_kv_cache):
+        """全局参数校验（依赖运行模式和插件配置）
+        
+        Args:
+            gpt_attention_plugin: 是否启用GPT Attention插件优化
+            remove_input_padding: 是否启用去填充优化
+            use_kv_cache: 是否使用KV Cache
+        Returns:
+            bool: 参数组合是否合法
+        """
         if gpt_attention_plugin:
+            # 插件模式下必须参数检查
             if use_kv_cache and self.sequence_length is None:
                 return False
             if self.context_lengths is None:
@@ -245,6 +407,7 @@ class AttentionParams(object):
                 return False
 
         if remove_input_padding:
+            # 去填充模式需host_context_lengths且启用插件
             if self.host_context_lengths is None:
                 return False
             if not gpt_attention_plugin:
