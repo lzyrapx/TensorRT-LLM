@@ -417,7 +417,46 @@ class AttentionParams(object):
 
 
 class SpecDecodingParams:
+    """ 管理推测式解码（Speculative Decoding）的运行时参数，用于加速自回归生成过程
+    
+    推测式解码通过预测多个候选词并验证其正确性来减少生成步骤，显著提升大语言模型的推理速度。
+    该类封装了候选生成长度、位置偏移、掩码等关键参数，支持动态调整和批量优化。
 
+    属性:
+        spec_decoding_is_generation_length_variable (bool): 
+            标记生成长度是否可变。若为True，表示不同样本允许生成不同数量的候选词。
+            默认值: False
+            
+        spec_decoding_max_generation_length (int): 
+            单步骤中允许的最大候选生成数量（所有样本统一上限）。
+            默认值: 1（即每次生成1个候选）
+            
+        spec_decoding_generation_lengths (Tensor, optional): 
+            每个样本的实际候选生成数量张量，形状为 [batch_size]。
+            当 `is_generation_length_variable=True` 时必填。
+            
+        spec_decoding_position_offsets (Tensor, optional): 
+            位置偏移量张量，形状为 [batch_size]，用于调整候选生成的位置编码。
+            适用于多轮对话等需要位置修正的场景。
+            
+        spec_decoding_packed_mask (Tensor, optional): 
+            打包掩码张量，形状为 [batch_size, max_generation_length]，标记有效候选位置。
+            用于批量处理中不同长度的候选序列（掩码无效位置）。
+            
+        spec_decoding_use (Tensor, optional): 
+            是否启用推测式解码的标志张量，形状为 [batch_size]（布尔类型）。
+            允许对批量中的部分样本启用推测解码。
+
+    示例:
+        >>> # 批量大小为2，最大生成3个候选，其中样本0生成2个，样本1生成3个
+        >>> generation_lengths = torch.tensor([2, 3], dtype=torch.int32)
+        >>> params = SpecDecodingParams(
+        >>>     spec_decoding_is_generation_length_variable=True,
+        >>>     spec_decoding_max_generation_length=3,
+        >>>     spec_decoding_generation_lengths=generation_lengths,
+        >>>     spec_decoding_use=torch.tensor([True, True])  # 全部启用
+        >>> )
+    """
     def __init__(self,
                  spec_decoding_is_generation_length_variable: bool = False,
                  spec_decoding_max_generation_length: int = 1,
@@ -426,23 +465,56 @@ class SpecDecodingParams:
                  spec_decoding_packed_mask: Tensor = None,
                  spec_decoding_use: Tensor = None):
 
-        self.spec_decoding_is_generation_length_variable = spec_decoding_is_generation_length_variable
-        self.spec_decoding_max_generation_length = spec_decoding_max_generation_length
-        self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
-        self.spec_decoding_position_offsets = spec_decoding_position_offsets
-        self.spec_decoding_packed_mask = spec_decoding_packed_mask
-        self.spec_decoding_use = spec_decoding_use
+        # 动态候选生成控制
+        self.spec_decoding_is_generation_length_variable = spec_decoding_is_generation_length_variable  # 是否允许变长生成
+        self.spec_decoding_max_generation_length = spec_decoding_max_generation_length  # 候选最大数量
+        self.spec_decoding_generation_lengths = spec_decoding_generation_lengths        # 各样本实际生成数量
+        
+        # 位置编码调整
+        self.spec_decoding_position_offsets = spec_decoding_position_offsets            # 位置偏移（对齐多轮对话）
+        
+        # 批量优化参数
+        self.spec_decoding_packed_mask = spec_decoding_packed_mask                      # 打包掩码（处理变长候选）
+        self.spec_decoding_use = spec_decoding_use                                      # 是否启用推测解码（按样本控制）
 
 
 class MropeParams:
+    """ 管理改进型旋转位置编码（Modified Rotary Positional Encoding, MROPE）的参数配置
+    
+    该类封装了动态旋转位置编码所需的预计算参数和位置偏移量，支持在注意力计算中灵活调整位置编码策略，
+    适用于需要增强长序列建模能力或动态位置调整的场景（如外推、位置插值）。
 
+    属性:
+        mrope_rotary_cos_sin (Tensor, optional): 
+            预计算的旋转矩阵参数（余弦和正弦值），形状通常为 [max_seq_len, head_dim] 或 [num_heads, max_seq_len, head_dim]。
+            用于在注意力计算中为每个位置生成旋转矩阵，实现位置感知的QK投影。
+            
+        mrope_position_deltas (Tensor, optional): 
+            动态位置偏移量张量，形状为 [batch_size, seq_len] 或 [batch_size]。
+            表示每个样本或每个位置需要调整的基位置偏移量，用于实现：
+            - 长上下文外推（如线性/动态插值）
+            - 多轮对话中的位置累积偏移
+            - 可变长度序列的弹性位置编码
+
+    示例:
+        >>> # 预计算旋转矩阵参数（以头维度64，最大序列长度2048为例）
+        >>> rotary_cos_sin = compute_rotary_matrix(max_len=2048, dim=64)
+        >>> # 批量位置偏移（如对话中第2轮对话的起始位置为100）
+        >>> position_deltas = torch.tensor([0, 100], dtype=torch.int32)  # 形状 [batch_size=2]
+        >>> params = MropeParams(
+        >>>     mrope_rotary_cos_sin=rotary_cos_sin,
+        >>>     mrope_position_deltas=position_deltas
+        >>> )
+    """
     def __init__(
         self,
         mrope_rotary_cos_sin: Tensor = None,
         mrope_position_deltas: Tensor = None,
     ):
-        self.mrope_rotary_cos_sin = mrope_rotary_cos_sin
-        self.mrope_position_deltas = mrope_position_deltas
+        # 旋转矩阵参数（余弦和正弦值预计算）
+        self.mrope_rotary_cos_sin = mrope_rotary_cos_sin  # 形状 [..., max_seq_len, head_dim]
+        # 动态位置偏移量（支持外推和弹性位置编码）
+        self.mrope_position_deltas = mrope_position_deltas  # 形状 [batch_size, ...]
 
 
 class KeyValueCacheParams:
@@ -2132,7 +2204,45 @@ class CogVLMAttention(Attention):
 
 
 class DeepseekV2Attention(Attention):
+    """ Deepseek V2 模型的定制化注意力机制，集成LoRA低秩适配与改进型旋转位置编码
+    
+    该类继承自基础注意力模块，针对Deepseek V2架构进行优化，支持动态低秩投影、弹性位置编码配置，
+    并与TensorRT-LLM插件深度集成以实现高效推理。
 
+    关键特性:
+        - **LoRA低秩适配**: 通过 `q_lora_rank` 和 `kv_lora_rank` 控制查询（Q）、键值（KV）的低秩投影维度。
+        - **混合位置编码**: 同时支持无位置编码（NOPE）和旋转位置编码（ROPE）的注意力头。
+        - **动态外推优化**: 通过 `rotary_scaling` 配置支持长上下文外推策略（如Yarn、线性插值）。
+        - **高效推理插件**: 与 `gpt_attention_plugin` 集成，支持KV缓存管理、推测解码等优化。
+
+    参数:
+        local_layer_idx (int): 当前注意力层在模型中的索引。
+        hidden_size (int): 输入隐藏层维度。
+        num_attention_heads (int): 注意力头数量。
+        q_lora_rank (int): 查询（Q）的低秩投影维度。若为None，启用Deepseek V2 Lite模式。
+        kv_lora_rank (int): 键值（KV）的低秩投影维度。
+        qk_nope_head_dim (int): 无位置编码（NOPE）的注意力头维度。
+        qk_rope_head_dim (int): 旋转位置编码（ROPE）的注意力头维度。
+        v_head_dim (int): 值（V）投影的头维度。
+        eps (float): LayerNorm 的小数稳定项。
+        attention_mask_type (AttentionMaskType): 掩码类型（因果/双向）。
+        dtype (str): 计算数据类型（如float16、bfloat16）。
+        position_embedding_type (PositionEmbeddingType): 位置编码类型（默认为学习绝对编码）。
+        max_position_embeddings (int): 最大位置编码长度。
+        rotary_embedding_base (float): RoPE的旋转基数（默认10000）。
+        rotary_embedding_scaling (dict): RoPE外推缩放配置（包含factor、mscale_all_dim等）。
+        tp_group (Optional): 张量并行组。
+        tp_size (int): 张量并行大小。
+        tp_rank (int): 当前张量并行秩。
+        quant_mode (QuantMode): 量化模式配置。
+
+    属性:
+        fused_a (ColumnLinear): 融合的输入投影层（处理Q/K/V的低秩投影）。
+        dense (RowLinear): 输出投影层（多头注意力结果合并）。
+        q_b_proj (Parameter): Q的低秩投影矩阵（LoRA适配）。
+        kv_b_proj (Parameter): KV的低秩投影矩阵（LoRA适配）。
+        embed_positions_for_gpt_attention (Parameter): 预计算的RoPE位置编码参数。
+    """
     def __init__(
             self,
             *,
@@ -2162,12 +2272,13 @@ class DeepseekV2Attention(Attention):
             tp_rank=0,
             quant_mode: QuantMode = QuantMode(0),
     ):
+        # 初始化基类（标准注意力配置）
         super().__init__(local_layer_idx=local_layer_idx,
                          hidden_size=hidden_size,
                          num_attention_heads=num_attention_heads,
-                         num_kv_heads=1,
+                         num_kv_heads=1,  # Deepseek V2使用单组KV头
                          max_position_embeddings=max_position_embeddings,
-                         attention_head_size=kv_lora_rank + qk_rope_head_dim,
+                         attention_head_size=kv_lora_rank + qk_rope_head_dim, # 头维度=KV低秩 + ROPE头维度
                          dtype=dtype,
                          attention_mask_type=attention_mask_type,
                          position_embedding_type=position_embedding_type,
@@ -2179,10 +2290,11 @@ class DeepseekV2Attention(Attention):
                          quant_mode=quant_mode,
                          bias=False,
                          dense_bias=False,
-                         enable_qkv=False)
+                         enable_qkv=False) # 禁用标准QKV投影（使用LoRA替代）
 
-        self.tp_size = tp_size
+        self.tp_size = tp_size # 张量并行大小
 
+        # LoRA配置模式判断（Lite模式无Q低秩）
         if q_lora_rank is None:
             self.q_lora_rank = hidden_size
             self.is_deepseek_v2_lite = True
@@ -2190,14 +2302,16 @@ class DeepseekV2Attention(Attention):
             self.q_lora_rank = q_lora_rank
             self.is_deepseek_v2_lite = False
 
+        # 投影维度配置
         self.kv_lora_rank = kv_lora_rank
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.rotary_embedding_dim = 0
-        self.rotary_scaling = rotary_scaling
-        self.shard_dim = 1
+        self.qk_nope_head_dim = qk_nope_head_dim  # 无位置编码头维度
+        self.qk_rope_head_dim = qk_rope_head_dim  # ROPE头维度
+        self.v_head_dim = v_head_dim  # 值投影头维度
+        self.rotary_embedding_dim = 0  # 动态计算
+        self.rotary_scaling = rotary_scaling  # RoPE外推配置
+        self.shard_dim = 1  # 张量并行分片维度
 
+        # RoPE外推缩放因子计算（Yarn策略）
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:
                 return 1.0
@@ -2209,8 +2323,9 @@ class DeepseekV2Attention(Attention):
             scaling_factor = self.rotary_scaling["factor"]
             if mscale_all_dim:
                 mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
-                self.q_scaling = 1.0 / (mscale * mscale)
+                self.q_scaling = 1.0 / (mscale * mscale) # 注意力分数缩放因子
 
+        # 预计算RoPE位置编码参数（支持外推）
         embed_positions_for_gpt_attention = RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
             self.max_position_embeddings, self.qk_rope_head_dim,
             self.rotary_embedding_base, self.rotary_scaling["factor"],
@@ -2219,42 +2334,47 @@ class DeepseekV2Attention(Attention):
             rotary_embedding_mscale_all_dim)
         self.register_parameter(
             'embed_positions_for_gpt_attention',
-            Parameter(embed_positions_for_gpt_attention, dtype='float32'))
+            Parameter(embed_positions_for_gpt_attention, dtype='float32'))  # 注册为模型参数
 
         self.rotary_embedding_scale_type = RotaryScalingType.none
         self.rotary_embedding_scale = 1.0
-
+        
+        # 构建低秩投影层（LoRA适配）
         if self.is_deepseek_v2_lite:
+            # Lite模式：仅KV低秩投影 + ROPE位置编码
             self.fused_a = ColumnLinear(
                 hidden_size,
-                kv_lora_rank + qk_rope_head_dim,
+                kv_lora_rank + qk_rope_head_dim,  # 输出维度=KV低秩 + ROPE头
                 bias=self.dense_bias,
                 dtype=dtype,
             )
         else:
+             # 全量模式：Q/KV低秩投影 + ROPE位置编码
             self.fused_a = ColumnLinear(
                 hidden_size,
-                q_lora_rank + kv_lora_rank + qk_rope_head_dim,
+                q_lora_rank + kv_lora_rank + qk_rope_head_dim,   # 输出维度=Q低秩 + KV低秩 + ROPE头
                 bias=self.dense_bias,
                 dtype=dtype,
             )
-            self.q_a_layernorm = RmsNorm(q_lora_rank, dtype=dtype, eps=eps)
+            self.q_a_layernorm = RmsNorm(q_lora_rank, dtype=dtype, eps=eps)  # Q低秩归一化
 
-        self.kv_a_layernorm = RmsNorm(kv_lora_rank, dtype=dtype, eps=eps)
-
+        self.kv_a_layernorm = RmsNorm(kv_lora_rank, dtype=dtype, eps=eps)   # KV低秩归一化
+        
+        # 定义LoRA投影矩阵参数
         self.kv_b_proj = Parameter(
             shape=(self.num_attention_heads * self.qk_nope_head_dim * 2,
                    self.kv_lora_rank),
-            dtype=dtype)
+            dtype=dtype)  # KV低秩到多头维度的投影
         self.k_b_proj_trans = Parameter(
             shape=(self.num_attention_heads * self.kv_lora_rank,
                    self.qk_nope_head_dim),
-            dtype=dtype)
+            dtype=dtype) # K低秩转置矩阵
         self.q_b_proj = Parameter(
             shape=(self.num_attention_heads *
                    (self.qk_nope_head_dim + self.qk_rope_head_dim),
                    self.q_lora_rank),
-            dtype=dtype)
+            dtype=dtype)  # Q低秩投影矩阵
+        # 输出投影层（多头合并）
         self.dense = RowLinear(tp_size * self.num_attention_heads *
                                self.v_head_dim,
                                hidden_size,
@@ -2262,6 +2382,7 @@ class DeepseekV2Attention(Attention):
                                dtype=dtype,
                                tp_group=tp_group,
                                tp_size=tp_size)
+        # 设置参数加载器（支持张量并行）
         set_obj_attrs(self.q_b_proj, {
             "weight_loader": self.weight_loader,
         })
@@ -2274,6 +2395,13 @@ class DeepseekV2Attention(Attention):
 
     def weight_loader(self, mapping: Mapping, param: Parameter,
                       loaded_weight: torch.Tensor):
+        """ 权重加载适配器（处理张量并行分片）
+        
+        Args:
+            mapping (Mapping): 模型权重映射配置
+            param (Parameter): 目标参数对象
+            loaded_weight (torch.Tensor): 原始加载的权重张量
+        """
         # use_parallel_embedding
         tp_rank = mapping.tp_rank
         if self.tp_size > 1:
@@ -2285,8 +2413,16 @@ class DeepseekV2Attention(Attention):
         param.value = loaded_weight
 
     def postprocess(self, tllm_key, weights, **kwargs):
-
+        """ 权重后处理（张量并行分片调整）
+        
+        Args:
+            tllm_key (str): 权重名称标识
+            weights (torch.Tensor): 原始权重张量
+        Returns:
+            dict: 调整后的权重字典
+        """
         def split_matrix_tp(v, tp_size, idx, dim=0):
+            """ 按张量并行维度分片张量 """
             if tp_size == 1:
                 return v
             if len(v.shape) == 1:
@@ -2294,6 +2430,7 @@ class DeepseekV2Attention(Attention):
             else:
                 return torch.chunk(v, tp_size, dim=dim)[idx].contiguous()
 
+        # Q低秩投影分片处理
         if tllm_key.find("q_b_proj") != -1:
             q_b_proj_weight = weights.unflatten(
                 0,
@@ -2313,7 +2450,7 @@ class DeepseekV2Attention(Attention):
                 self.num_attention_heads * self.tp_size *
                 (self.qk_nope_head_dim + self.qk_rope_head_dim) // self.tp_size,
                 self.q_lora_rank)
-
+        # KV低秩投影分片处理
         elif tllm_key.find("kv_b_proj") != -1:
             kv_b_proj_weight = weights.unflatten(
                 0,
@@ -2332,6 +2469,7 @@ class DeepseekV2Attention(Attention):
                 [self.qk_nope_head_dim, self.v_head_dim],
                 dim=1,
             )
+            # 重组K和V的低秩投影
             weights = torch.concat([
                 k_nope_weight.reshape(
                     self.num_attention_heads * self.tp_size *
@@ -2341,7 +2479,7 @@ class DeepseekV2Attention(Attention):
                     self.tp_size, self.kv_lora_rank)
             ],
                                    dim=0)
-
+        # K转置矩阵分片处理
         elif tllm_key.find("k_b_proj_trans") != -1:
             kv_b_proj = weights.unflatten(0, [
                 self.num_attention_heads * self.tp_size,
@@ -2364,16 +2502,30 @@ class DeepseekV2Attention(Attention):
                 spec_decoding_params=None,
                 kv_cache_params=None,
                 attention_params=None):
+        """ 前向传播（集成TensorRT-LLM插件优化）
+        
+        Args:
+            hidden_states (Tensor): 输入隐藏状态，形状为 [batch_size, seq_len, hidden_size]
+            use_cache (bool): 是否缓存KV（用于自回归生成）
+            spec_decoding_params (SpecDecodingParams): 推测式解码参数
+            kv_cache_params (KeyValueCacheParams): KV缓存管理参数
+            attention_params (AttentionParams): 注意力计算参数（掩码、位置编码等）
+        Returns:
+            Tensor: 注意力输出，形状同输入。若启用缓存，返回(output, past_key_value)
+        """
+        # 输入验证：必须启用去除输入填充（简化计算）
         assert default_net().plugin_config.remove_input_padding
 
         spec_decoding_params = SpecDecodingParams(
         ) if spec_decoding_params is None else spec_decoding_params
 
+        # 检查输入形状（去除填充后应为2D：[total_tokens, hidden_size]）
         if default_net().plugin_config.remove_input_padding:
             assert hidden_states.ndim() == 2
 
         default_net().plugin_config.paged_kv_cache
 
+        # 检查插件配置和参数合法性
         assert attention_params is None or attention_params.is_valid(
             default_net().plugin_config.gpt_attention_plugin,
             default_net().plugin_config.remove_input_padding, use_cache)
@@ -2382,15 +2534,19 @@ class DeepseekV2Attention(Attention):
             assert kv_cache_params is None or kv_cache_params.is_valid(
                 default_net().plugin_config.gpt_attention_plugin)
 
+        # 获取历史KV缓存（自回归生成时使用）
         past_key_value = None if kv_cache_params is None else kv_cache_params.get_first_past_key_value(
         )
 
+        # 执行低秩投影与位置编码融合
         if self.is_deepseek_v2_lite:
+            # Lite模式：KV低秩 + ROPE位置编码
             compressed_kv, k_pe = self.fused_a(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             input_qkv = concat([hidden_states, compressed_kv, k_pe], dim=-1)
         else:
+            # 全量模式：Q低秩 + KV低秩 + ROPE位置编码
             compressed_q, compressed_kv, k_pe = self.fused_a(
                 hidden_states).split([
                     self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
@@ -2399,16 +2555,19 @@ class DeepseekV2Attention(Attention):
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             input_qkv = concat([compressed_q, compressed_kv, k_pe], dim=-1)
 
+        # 调用TensorRT-LLM插件优化后的注意力计算
         if default_net().plugin_config.gpt_attention_plugin:
             if self.cross_attention and (past_key_value is not None):
                 past_key_value = kv_cache_params.past_key_value[1]
+            # 确认支持的注意力掩码类型
             assert self.attention_mask_type in [
                 AttentionMaskType.causal,
                 AttentionMaskType.bidirectional,
                 AttentionMaskType.bidirectionalglm,
-            ], 'Plugin only support masked MHA.'
+            ], 'Plugin only support masked MHA.'  # 插件仅支持因果/双向掩码
 
             # KV cache scales.
+            #  处理KV缓存量化缩放因子（若启用量化）
             if self.kv_cache_scaling_factor is not None:
                 kv_orig_quant_scale = self.kv_cache_rcp_scaling_factor.value
                 kv_quant_orig_scale = self.kv_cache_scaling_factor.value
@@ -2416,36 +2575,36 @@ class DeepseekV2Attention(Attention):
                 kv_orig_quant_scale = None
                 kv_quant_orig_scale = None
 
+            # 获取预计算的RoPE位置编码参数
             rotary_cos_sin = self.embed_positions_for_gpt_attention.value
 
+            # 调用插件化注意力计算核心
             context, past_key_value = gpt_attention(
-                qkv=input_qkv,
-                past_key_value=past_key_value,
-                sequence_length=attention_params.sequence_length,
-                host_past_key_value_lengths=kv_cache_params.
-                host_past_key_value_lengths,
-                host_max_attention_window_sizes=kv_cache_params.
-                host_max_attention_window_sizes,
-                host_sink_token_length=kv_cache_params.host_sink_token_length,
-                context_lengths=attention_params.context_lengths,
-                cache_indirection=kv_cache_params.cache_indirection,
-                host_request_types=attention_params.host_request_types,
-                layer_idx=self.local_layer_idx,
-                num_heads=self.num_attention_heads,
-                num_kv_heads=1,
+                qkv=input_qkv, # 输入融合后的QKV投影
+                past_key_value=past_key_value,  # 历史KV缓存
+                sequence_length=attention_params.sequence_length,  # 当前序列长度
+                host_past_key_value_lengths=kv_cache_params.host_past_key_value_lengths, # 历史长度（Host内存）
+                host_max_attention_window_sizes=kv_cache_params.host_max_attention_window_sizes,  # 最大窗口大小
+                host_sink_token_length=kv_cache_params.host_sink_token_length,  # Sink Token长度（流式处理）
+                context_lengths=attention_params.context_lengths,  # 有效上下文长度
+                cache_indirection=kv_cache_params.cache_indirection,  # 缓存索引重定向
+                host_request_types=attention_params.host_request_types, # 请求类型（上下文/生成）
+                layer_idx=self.local_layer_idx,  # 当前层索引
+                num_heads=self.num_attention_heads, # 注意力头数
+                num_kv_heads=1,  # KV头数（Deepseek V2为1）
                 num_kv_heads_origin=1,
-                hidden_size_per_head=self.kv_lora_rank + self.qk_rope_head_dim,
-                q_scaling=self.q_scaling,
-                position_embedding_type=self.position_embedding_type,
+                hidden_size_per_head=self.kv_lora_rank + self.qk_rope_head_dim, # 头维度
+                q_scaling=self.q_scaling,  # 注意力分数缩放因子
+                position_embedding_type=self.position_embedding_type,  # 位置编码类型
                 rotary_inv_freq=None,
-                rotary_cos_sin=rotary_cos_sin,
-                kv_orig_quant_scale=kv_orig_quant_scale,
-                kv_quant_orig_scale=kv_quant_orig_scale,
+                rotary_cos_sin=rotary_cos_sin,  # RoPE预计算参数
+                kv_orig_quant_scale=kv_orig_quant_scale,  # KV缓存反量化因子
+                kv_quant_orig_scale=kv_quant_orig_scale,  # KV缓存量化因子
                 attention_output_orig_quant_scale=self.
                 _get_output_orig_quant_scale(),
                 kv_cache_quant_mode=self.quant_mode,
-                max_context_length=attention_params.max_context_length,
-                mask_type=self.attention_mask_type,
+                max_context_length=attention_params.max_context_length,  # 最大上下文长度
+                mask_type=self.attention_mask_type,  # 掩码类型
                 block_sparse_block_size=self.block_sparse_params.block_size,
                 block_sparse_homo_head_pattern=self.block_sparse_params.
                 homo_head_pattern,
@@ -2454,8 +2613,8 @@ class DeepseekV2Attention(Attention):
                 block_sparse_vertical_stride=self.block_sparse_params.
                 vertical_stride,
                 alibi_slopes=None,
-                tp_size=self.tp_size,
-                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,  # 张量并行大小
+                tp_rank=self.tp_rank,  # 当前张量并行秩
                 kv_cache_block_offsets=kv_cache_params.kv_cache_block_offsets
                 if not self.cross_attention else
                 kv_cache_params.cross_kv_cache_block_offsets,
@@ -2492,17 +2651,20 @@ class DeepseekV2Attention(Attention):
                 host_runtime_perf_knobs,
                 host_context_progress=attention_params.host_context_progress,
                 is_mla_enabled_flag=True,
+                # Deepseek V2特有参数传递
                 q_lora_rank=self.q_lora_rank,
                 kv_lora_rank=self.kv_lora_rank,
                 qk_nope_head_dim=self.qk_nope_head_dim,
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 v_head_dim=self.v_head_dim,
-                fused_q_proj=self.fused_q_proj.value,
-                q_b_proj=self.q_b_proj.value,
-                kv_b_proj=self.kv_b_proj.value)
+                fused_q_proj=self.fused_q_proj.value,  # 融合Q投影参数
+                q_b_proj=self.q_b_proj.value,  # Q低秩投影矩阵
+                kv_b_proj=self.kv_b_proj.value)  # KV低秩投影矩阵
 
+        # 输出投影（多头合并）
         context = self.dense(context)
 
+        # 返回结果（若启用缓存，返回输出与更新后的KV缓存）
         if use_cache:
             return (context, past_key_value)
         else:
