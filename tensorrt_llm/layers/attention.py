@@ -518,7 +518,10 @@ class MropeParams:
 
 
 class KeyValueCacheParams:
-
+    """
+    用于管理键值（KV）缓存参数的类，通常在Transformer模型的自注意力和交叉注意力机制中使用。
+    此类封装了与KV缓存相关的各种参数，包括设备端和主机端的张量，用于优化推理过程中的内存管理和计算效率。
+    """
     def __init__(self,
                  past_key_value: List[Tensor] = None,
                  host_past_key_value_lengths: Tensor = None,
@@ -534,6 +537,46 @@ class KeyValueCacheParams:
                  host_cross_kv_cache_block_offsets: Tensor = None,
                  host_cross_kv_cache_pool_pointers: Tensor = None,
                  host_cross_kv_cache_pool_mapping: Tensor = None):
+        """
+        初始化键值缓存参数
+
+        Args:
+            past_key_value (List[Tensor], optional): 多层过去的键值张量缓存列表，每个元素对应一个层的(K, V)缓存。
+                例如: [ (layer1_key, layer1_val), (layer2_key, layer2_val), ... ]
+                
+            host_past_key_value_lengths (Tensor, optional): 位于主机内存的整型张量，表示每个过去键值缓存序列的长度。
+                用于记录各序列历史长度，形状通常为 [batch_size]
+                
+            host_max_attention_window_sizes (Tensor, optional): 位于主机内存的整型张量，表示各层的最大注意力窗口大小。
+                用于控制滑动窗口注意力机制的窗口尺寸，形状为 [num_layers]
+                
+            host_sink_token_length (Tensor, optional): 位于主机内存的整型张量，表示"sink token"的长度。
+                "Sink token"指某些模型（如Llama）在注意力机制开头必须处理的特殊token数量
+                
+            kv_cache_block_offsets (Tensor, optional): 位于设备内存的整型张量，表示KV缓存块的偏移量索引。
+                用于定位当前批次各序列在KV缓存块中的位置，形状通常为 [batch_size, max_blocks_per_sequence]
+                
+            host_kv_cache_block_offsets (Tensor, optional): 主机内存版本的kv_cache_block_offsets，用于CPU到GPU的数据传输
+                
+            host_kv_cache_pool_pointers (Tensor, optional): 位于主机内存的指针数组，指向KV缓存内存池中的空闲块。
+                用于动态KV缓存内存管理
+                
+            host_kv_cache_pool_mapping (Tensor, optional): 位于主机内存的映射表，记录序列到缓存块的分配情况。
+                用于维护序列与缓存块之间的映射关系
+                
+            cache_indirection (Tensor, optional): 位于设备内存的整型张量，用于缓存间接寻址。
+                在并行解码时，维护不同生成步骤中缓存位置的映射，形状通常为 [batch_size, beam_width, max_seq_len]
+                
+            past_key_value_length (Tensor, optional): （已弃用）过去键值缓存的长度，被host_past_key_value_lengths替代
+                
+            cross_kv_cache_block_offsets (Tensor, optional): 交叉注意力层的KV缓存块偏移量，用途同kv_cache_block_offsets但作用于交叉注意力
+                
+            host_cross_kv_cache_block_offsets (Tensor, optional): 主机内存版本的交叉注意力KV缓存块偏移量
+                
+            host_cross_kv_cache_pool_pointers (Tensor, optional): 交叉注意力层的内存池指针，类似host_kv_cache_pool_pointers
+                
+            host_cross_kv_cache_pool_mapping (Tensor, optional): 交叉注意力层的缓存块映射表，类似host_kv_cache_pool_mapping
+        """
         self.past_key_value = past_key_value
         self.host_past_key_value_lengths = host_past_key_value_lengths
         self.host_max_attention_window_sizes = host_max_attention_window_sizes
@@ -550,16 +593,38 @@ class KeyValueCacheParams:
         # self.past_key_value_length = past_key_value_length
 
     def get_first_past_key_value(self):
+        """
+        获取第一个层的过去键值缓存（通常用于单层操作或调试）
+
+        Returns:
+            Union[Tensor, None]: 第一个层的(K, V)缓存元组。如果无缓存则返回None
+        """
         if self.past_key_value is None:
             return None
         return self.past_key_value[0]
 
     def fill_none_tensor_list(self, list_size):
+        """
+        将past_key_value初始化为指定长度的None列表（用于占位初始化）
+
+        Args:
+            list_size (int): 需要初始化的列表长度，通常对应Transformer的层数
+        """        
         if self.past_key_value is None:
             self.past_key_value = tuple([None] * list_size)
 
     def is_valid(self, gpt_attention_plugin):
+        """
+        验证当前参数配置是否有效（主要针对启用GPT注意力插件时的必要参数检查）
+
+        Args:
+            gpt_attention_plugin (bool): 是否启用了GPT注意力插件
+
+        Returns:
+            bool: 当启用插件时，检查必要参数是否存在；未启用时直接返回True
+        """        
         if gpt_attention_plugin:
+            # 插件模式下必须存在的参数检查
             if self.host_past_key_value_lengths is None:
                 return False
             if self.host_max_attention_window_sizes is None:
@@ -573,13 +638,31 @@ class KeyValueCacheParams:
 
 
 class BlockSparseAttnParams:
+    """块稀疏注意力机制参数配置类
 
+    用于配置Transformer模型中块稀疏注意力（Block Sparse Attention）的计算参数，
+    通过限制注意力作用范围来提升计算效率
+    
+    Args:
+        block_size (int, optional): 
+            基础注意力块的大小（单位：token数量），控制注意力计算的粒度。
+            较大的值会减少计算量但降低细粒度注意力，默认64
+        homo_head_pattern (bool, optional):
+            是否所有注意力头使用相同的稀疏模式。
+            True可减少内存占用，False允许不同头有不同的注意力模式，默认False
+        num_local_blocks (int, optional):
+            每个token需要关注的局部注意力块数量。
+            控制局部上下文的注意力范围，默认16（即每个token关注前16个块）
+        vertical_stride (int, optional):
+            垂直方向（序列维度）的块间隔跨度。
+            控制全局注意力的覆盖密度，较大的值会跳过更多块，默认8
+    """
     def __init__(self,
                  block_size: int = 64,
                  homo_head_pattern: bool = False,
                  num_local_blocks: int = 16,
                  vertical_stride: int = 8):
-        self.block_size = block_size
+        self.block_size = block_size  # 块大小
         self.homo_head_pattern = homo_head_pattern
         self.num_local_blocks = num_local_blocks
         self.vertical_stride = vertical_stride
@@ -747,11 +830,15 @@ class Attention(Module):
         # out dim is not necessarily hidden_size + kv specific size (in MQA/GQA), but num_heads * heads_size
         # example: d_model != num_heads * head_size in Flan-T5/ByT5/Gemma
         if enable_qkv:
+            # TensorRT-LLM可能将Q、K、V合并为一个张量以优化计算效率。
+            # 在多头注意力中，该张量会在内部被分割为独立的头，并重新排列以匹配计算需求。例如，假设有12个头，每个头64维，合并后的qkv会被拆分为[Q, K, V]，再分头处理
+            # self.qkv: linear()
+            # tp_size > 1 就按列切分, 并转换成矩阵乘
+            # tp_size == 1， 则不切分
             self.qkv = ColumnLinear(
                 hidden_size,
                 tp_size * self.num_attention_heads * self.attention_head_size +
-                (2 * tp_size * self.num_attention_kv_heads *
-                 self.attention_head_size),
+                (2 * tp_size * self.num_attention_kv_heads * self.attention_head_size),
                 bias=bias,
                 dtype=dtype,
                 tp_group=tp_group,
@@ -988,6 +1075,7 @@ class Attention(Module):
             attention_output_orig_quant_scale = attention_output_orig_quant_scale / 6.0
         return attention_output_orig_quant_scale
 
+    # 前向传播
     def forward(
         self,
         hidden_states: Tensor,
@@ -1036,6 +1124,7 @@ class Attention(Module):
 
         unfuse_qkv_gemm = self.qkv is None
         if unfuse_qkv_gemm:
+            # qkv 没有被合并
             qkv_gemm = [self.q, self.k, self.v]
             qkv = [gemm(hidden_states) for gemm in qkv_gemm]
             if default_net(
@@ -1047,9 +1136,16 @@ class Attention(Module):
                                  dim=1)
                 qkv = [tensor + lora for tensor, lora in zip(qkv, qkv_lora)]
         else:
+            # qkv 被合并，然后和 hidden states 做 linear()
+            # 这个 qkv 的 shape 为 (-1, tp_size * num_attention_heads * attention_head_size + (2 * tp_size * num_attention_kv_heads * attention_head_size))
+            # qkv 此时 等于：
+            # self.q_proj(hidden_states)
+            # self.k(hidden_states)
+            # self.v(hidden_sates)
             qkv = self.qkv(hidden_states, qkv_lora_params)
 
         if self.clip_qkv is not None:
+            # 切割 qkv
             qkv = clip(qkv, -self.clip_qkv, self.clip_qkv)
 
         if default_net().plugin_config.remove_input_padding:
@@ -1326,6 +1422,9 @@ class Attention(Module):
                 assert long_rope_rotary_cos_sin is not None
 
             context, past_key_value = gpt_attention(
+                # 这个 qkv 的 shape 为 (-1, tp_size * num_attention_heads * attention_head_size + (2 * tp_size * num_attention_kv_heads * attention_head_size))
+                # 形状中的 -1 表示动态维度，对应 batch_size * sequence_length（即所有token的数量）
+                # -1 是指动态维度，用户后续推理时，-1 会替换成 num_tokens
                 qkv=qkv,
                 past_key_value=past_key_value,
                 attention_mask=attention_mask,
