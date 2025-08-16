@@ -22,6 +22,7 @@ from utils.util import (skip_blackwell_geforce, skip_pre_blackwell_unittest,
                         unittest_name_func)
 
 import tensorrt_llm
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 
 
 # Used by the (fp16 -> int4) quant layer + int4 gemm network.
@@ -78,8 +79,9 @@ class TestFunctional(unittest.TestCase):
                                                       1 / b_global_sf,
                                                       sf_vec_size)
 
-        c = (torch.ops.trtllm.fp4_gemm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
-                                       False).float().cpu())
+        c = (torch.ops.trtllm.fp4_gemm(
+            a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4).float().cpu())
 
         torch.cuda.synchronize()
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
@@ -125,27 +127,40 @@ class TestFunctional(unittest.TestCase):
         c_pt = torch.nn.functional.linear(a_pt, b_pt)
         self.assertTrue(torch.allclose(c_pt, c, atol=1e-2, rtol=1e-2))
 
-    @parameterized.expand(list([[1024, 1024, torch.half, False],
-                                [2, 512, torch.bfloat16, False],
-                                [13, 16, torch.half, True]]),
+    @parameterized.expand(list([[1024, 1024, torch.half, False, True],
+                                [2, 512, torch.bfloat16, False, True],
+                                [2, 512, torch.bfloat16, True, True],
+                                [16, 512, torch.half, True, True],
+                                [16, 512, torch.half, False, True],
+                                [16, 512, torch.half, True, False],
+                                [16, 512, torch.half, False, False]]),
                           name_func=unittest_name_func)
     @skip_pre_blackwell_unittest
-    def test_fp4_quantize_torch(self, m, k, dtype, use_ue8m0):
+    def test_fp4_quantize_torch(self, m, k, dtype, use_ue8m0,
+                                is_sf_swizzled_layout):
         a = torch.randn([m, k], dtype=torch.float32).to(dtype).float()
+        if use_ue8m0:
+            # Expand the range of the input to cover more cases
+            a = a * 16
+
         a_global_sf = (448 * 6) / a.abs().max().float()
-        sf_vec_size = 16
+        sf_vec_size = 32 if use_ue8m0 else 16
 
         a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(
-            a.to(dtype).cuda(), a_global_sf.cuda(), sf_vec_size, use_ue8m0)
+            a.to(dtype).cuda(), a_global_sf.cuda(), sf_vec_size, use_ue8m0,
+            is_sf_swizzled_layout)
+
+        sf_type = 0 if use_ue8m0 else 1
 
         a_pt = e2m1_and_ufp8_scale_to_float_tensor_v2(a_fp4.cpu(), a_sf.cpu(),
                                                       1 / a_global_sf,
-                                                      sf_vec_size)
+                                                      sf_vec_size, sf_type,
+                                                      is_sf_swizzled_layout)
 
         torch.cuda.synchronize()
-        if not use_ue8m0:
-            # The gap is too large for ue8m0, so we just make sure that it runs
-            self.assertTrue(torch.allclose(a_pt, a, atol=1, rtol=0))
+        atol = 8 if use_ue8m0 else 1
+        rtol = 0
+        self.assertTrue(torch.allclose(a_pt, a, atol=atol, rtol=rtol))
 
     @parameterized.expand(list([[2, 16, torch.half, False, True],
                                 [2, 16, torch.half, False, False],
@@ -155,11 +170,12 @@ class TestFunctional(unittest.TestCase):
                                 [1024, 512, torch.bfloat16, True, False]]),
                           name_func=unittest_name_func)
     @skip_pre_blackwell_unittest
-    def test_fp4_quantize_torch_different_sf_layot(self, m, k, dtype, use_ue8m0,
-                                                   is_sf_swizzled_layout):
+    def test_fp4_quantize_torch_different_sf_layout(self, m, k, dtype,
+                                                    use_ue8m0,
+                                                    is_sf_swizzled_layout):
         a = torch.randn([m, k], dtype=torch.float32).to(dtype).float()
         a_global_sf = (448 * 6) / a.abs().max().float()
-        sf_vec_size = 16
+        sf_vec_size = 32 if use_ue8m0 else 16
 
         a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(
             a.to(dtype).cuda(), a_global_sf.cuda(), sf_vec_size, use_ue8m0,
@@ -176,7 +192,7 @@ class TestFunctional(unittest.TestCase):
             self.assertTrue(torch.allclose(a_pt, a, atol=1, rtol=0))
 
     @parameterized.expand(list([[64, 64, torch.float8_e4m3fn, False, True],
-                                [13, 16, torch.float8_e4m3fn, True, True],
+                                [13, 32, torch.float8_e4m3fn, True, True],
                                 [3, 48, torch.float8_e4m3fn, False, False],
                                 [1024, 1024, torch.float8_e4m3fn, True,
                                  False]]),
@@ -190,7 +206,7 @@ class TestFunctional(unittest.TestCase):
         a_fp8 = (a / amax * 448).to(dtype)
         aq_fp32 = a_fp8.float() * amax / 448
         a_global_sf = (448 * 6) / amax
-        sf_vec_size = 16
+        sf_vec_size = 32 if use_ue8m0 else 16
 
         a_fp4, a_sf = torch.ops.trtllm.fp4_quantize(a_fp8.cuda(),
                                                     a_global_sf.cuda(),
@@ -255,8 +271,9 @@ class TestProfiling(unittest.TestCase):
                                                       1 / b_global_sf,
                                                       sf_vec_size)
 
-        c_ref = torch.ops.trtllm.fp4_gemm(a_fp4, b_fp4, a_sf, b_sf,
-                                          ab_global_sf, False)
+        c_ref = torch.ops.trtllm.fp4_gemm(
+            a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4)
 
         best_config_idx = profiler.get_best_config_id(m, n, k)
         c_actual = profiler.run_gemm(a_fp4, b_fp4, a_sf, b_sf, ab_global_sf,

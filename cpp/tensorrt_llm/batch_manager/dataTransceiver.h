@@ -34,41 +34,10 @@
 namespace tensorrt_llm::batch_manager
 {
 
-// Used to support the data transmission with different layouts and different protocols.
-class IOFormatter
-{
-public:
-    using SizeType32 = tensorrt_llm::runtime::SizeType32;
-    using CacheState = executor::kv_cache::CacheState;
-
-    virtual void formatOutput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
-        = 0;
-
-    virtual void formatInput(LlmRequest const& llmRequest,
-        std::vector<executor::kv_cache::Connection const*> const& connections, CacheState const& selfConfig,
-        SizeType32 selfIdx, CacheState const& destConfig, runtime::BufferManager const& bufferManager)
-        = 0;
-
-    /// @brief Determine whether the sender is applicable to the source and target.
-    /// @param selfConfig Source data arrangement.
-    /// @param destConfig Target data arrangement.
-    /// @return Whether the sender is applicable to the source and target.
-    [[nodiscard]] virtual bool inquireSupport(CacheState const& selfConfig, CacheState const& destConfig) const = 0;
-
-    /// @brief Obtain the indies of the counterparts that need to be actually communicated with.
-    /// @param selfConfig Source data arrangement.
-    /// @param selfIdx The sequential index of the current executor process within the entire parallel group.
-    /// @param destConfig Target data arrangement.
-    /// @return The indies of the counterparts.
-    [[nodiscard]] virtual std::vector<SizeType32> getCounterparts(
-        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig) const
-        = 0;
-
-    /// @brief Destructor.
-    virtual ~IOFormatter() = default;
-};
+// TODO: unify the following class into a namespace like tensorrt_llm::transmission
+using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
+using Connection = tensorrt_llm::executor::kv_cache::Connection;
+using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
 // executor smoothly receives the data.
@@ -82,6 +51,7 @@ public:
 
     RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes,
         executor::DataTransceiverState transState);
+    RequestInfo() = default;
 
     /// @brief Equality comparison operator.
     /// @param rhs The right operand of the operator.
@@ -124,6 +94,99 @@ private:
     executor::DataTransceiverState mTransState;
 };
 
+class TransferSession
+{
+public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
+    TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
+        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
+        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        : mConnections(std::move(connections))
+        , mDataContext(dataContext)
+        , mSelfState(&selfState)
+        , mOtherState(std::move(otherState))
+        , mBufferManager(&bufferManager)
+        , mRequest(llmRequest)
+        , mRecordMeasure(recordMeasure)
+    {
+        TLLM_CHECK(!mConnections.empty());
+    }
+
+    [[nodiscard]] std::vector<Connection const*> const& getConnections() const
+    {
+        return mConnections;
+    }
+
+    // should be called only during the initialization of the TransferSession
+    void setConnection(size_t idx, Connection const* conn)
+    {
+        mConnections.at(idx) = conn;
+    }
+
+    [[nodiscard]] DataContext const& getDataContext() const
+    {
+        return mDataContext;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getSelfState() const
+    {
+        return *mSelfState;
+    }
+
+    [[nodiscard]] executor::DataTransceiverState const& getOtherState() const
+    {
+        return mOtherState;
+    }
+
+    [[nodiscard]] runtime::BufferManager const& getBufferManager() const
+    {
+        return *mBufferManager;
+    }
+
+    void send(size_t idx, void const* data, size_t size)
+    {
+        mConnections.at(idx)->send(mDataContext, data, size);
+    }
+
+    void recv(size_t idx, void* data, size_t size)
+    {
+        mConnections.at(idx)->recv(mDataContext, data, size);
+    }
+
+    [[nodiscard]] LlmRequest const& getLlmRequest() const
+    {
+        TLLM_CHECK(mRequest != nullptr);
+        return *mRequest;
+    }
+
+    // in DataSender, the LlmRequest is not available until the sendSync is called
+    void setLlmRequest(LlmRequest const& llmRequest)
+    {
+        mRequest = &llmRequest;
+    }
+
+    void appendMeasure(double delay, double duration, size_t size);
+
+    // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
+    void exportMeasure(std::ofstream& outFile, bool isContext) const;
+
+private:
+    std::vector<Connection const*> mConnections;
+    DataContext mDataContext;
+    executor::DataTransceiverState const* mSelfState; // stored in DataRequester/DataResponder
+    executor::DataTransceiverState mOtherState;
+    runtime::BufferManager const* mBufferManager;
+    LlmRequest const* mRequest;
+    bool mRecordMeasure;
+    std::vector<Measure> mMeasures;
+};
+
 // Operators required for data transmission in specific communication protocols.
 class DataSender
 {
@@ -158,11 +221,11 @@ class DataReceiver
 public:
     /// @brief Send the request information.
     /// @param llmRequest The request object to which the information belongs.
-    virtual void sendRequestInfo(LlmRequest const& llmRequest) = 0;
+    virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest) = 0;
 
     /// @brief Synchronously receive data.
-    /// @param llmRequest The request object to which the data belongs.
-    virtual void receiveSync(LlmRequest const& llmRequest) = 0;
+    /// @param session The transfer session.
+    virtual void receiveSync(TransferSession& session) = 0;
 
     /// @brief Destructor.
     virtual ~DataReceiver() = default;
@@ -216,66 +279,6 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
-};
-
-class KvCacheMeasureHelper
-{
-public:
-    KvCacheMeasureHelper(std::string output_path)
-        : mOutputPath(std::move(output_path))
-    {
-    }
-
-    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double duration, size_t size)
-    {
-        auto bandwidth = size * 8 / (duration / 1000) / 1e9;
-        if (mOutputPath.empty())
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(mMutex);
-        mRequestKVCacheTranfserMeasure[requestId].emplace_back(duration, bandwidth);
-    }
-
-    ~KvCacheMeasureHelper()
-    {
-        if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
-        {
-            auto rank = mpi::MpiComm::world().getRank();
-            std::string outFilePath = mOutputPath + "rank_" + std::to_string(rank) + ".txt";
-            std::ofstream outFile(outFilePath);
-
-            TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
-
-            size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
-
-            outFile << "RequestID";
-            for (size_t i = 0; i < numTransferMeasure; i++)
-            {
-                outFile << ",TimeDuration,Bandwidth";
-            }
-            outFile << '\n';
-
-            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
-            {
-                outFile << requestID;
-
-                for (auto const& [time, bandwidth] : measures)
-                {
-                    outFile << "," << time << "," << bandwidth;
-                }
-                outFile << '\n';
-            }
-
-            outFile.close();
-        }
-    }
-
-private:
-    std::map<LlmRequest::RequestIdType, std::vector<std::pair<double, double>>> mRequestKVCacheTranfserMeasure;
-    std::string mOutputPath;
-    std::mutex mMutex;
 };
 
 } // namespace tensorrt_llm::batch_manager

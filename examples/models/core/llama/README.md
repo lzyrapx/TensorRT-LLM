@@ -37,6 +37,10 @@ This document shows how to build and run a LLaMA model in TensorRT-LLM on both s
     - [Convert Checkpoint to TensorRT-LLM Unified Checkpoint](#convert-checkpoint-to-tensorrt-llm-unified-checkpoint)
     - [Build Engine](#build-engine)
     - [Run Inference](#run-inference)
+  - [Run LLaMa-3.3 70B Model on PyTorch Backend](#run-llama-33-70b-model-on-pytorch-backend)
+    - [Prepare TensorRT-LLM extra configs](#prepare-tensorrt-llm-extra-configs)
+    - [Launch trtllm-serve OpenAI-compatible API server](#launch-trtllm-serve-openai-compatible-api-server)
+    - [Run performance benchmarks](#run-performance-benchmarks)
 
 ## Overview
 
@@ -47,7 +51,7 @@ The TensorRT-LLM LLaMA implementation can be found in [tensorrt_llm/models/llama
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
 * [`run.py`](../../../run.py) to run the inference on an input text;
-* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/cnn_dailymail) dataset.
+* [`summarize.py`](../../../summarize.py) to summarize the articles in the [cnn_dailymail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset.
 
 ## Support Matrix
   * BF16/FP16
@@ -128,7 +132,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp16_wq \
             --output_dir ./tmp/llama/7B/trt_engines/weight_only/1-gpu/ \
             --gemm_plugin auto
 
-# Build LLaMA 7B using 2-way auto parallelism.
+# Build LLaMA 7B using 2-way auto parallelism (deprecated).
 python convert_checkpoint.py --model_dir ./tmp/llama/7B/ \
                             --output_dir ./tllm_checkpoint_1gpu_fp16 \
                             --dtype float16
@@ -672,7 +676,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_2gpu_fp8 \
 The peak GPU memory consumption when doing FP8 quantizaton is more than 210GB (there is also some activation memory occupation when doing calibration).
 So you need a node with at least 4 H100(A100) to run the quantization command. After quantization, 2 GPUs are okay to for building and run.
 
-Experimental: use FP8 GEMV to optimize performance in FP8 small-batch-size cases.
+Note: use FP8 GEMV to optimize performance in FP8 small-batch-size cases.
 
 ```bash
 # Quantize HF LLaMA 7B into FP8 and export trtllm checkpoint
@@ -690,7 +694,7 @@ trtllm-build --checkpoint_dir ./tllm_checkpoint_1gpu_fp8 \
              --gemm_plugin fp8
 ```
 
-**Note**: FP8 gemm plugin is an experimental feature aimed to improve performance in small-batch-size cases(e.g. BS<=4). Although inputs with batch size larger than 4 can be correctly inferenced, the performance may decrease as batch size grows.
+**Note**: FP8 gemv plugin uses CUDA cores to compute, by contrast to Tensor Core gemm kernel within cuBLAS. Over last year, as cuBLAS have improved their performance by a lot under small M case for Hopper(sm90), FP8 gemv kernel may or may not surpass cuBLAS, depending on specific gemm problem shape. Nonetheless, we still strongly recommend FP8 gemv kernel for Ada (sm89) as cuBLAS still falls behind gemv on it.
 
 ### Groupwise quantization (AWQ/GPTQ)
 One can enable AWQ/GPTQ INT4 weight only quantization with these options when building engine with `trtllm-build`:
@@ -1541,4 +1545,51 @@ bash -c 'python ./examples/mmlu.py --test_trt_llm \
                                    --enable_chunked_context \
                                    --kv_cache_free_gpu_memory_fraction 0.999 \
                                    --max_tokens_in_paged_kv_cache 65064'
+```
+
+## Run LLaMa-3.3 70B Model on PyTorch Backend
+This section provides the steps to run LLaMa-3.3 70B model FP8 precision on PyTorch backend by launching TensorRT-LLM server and run performance benchmarks.
+
+
+### Prepare TensorRT-LLM extra configs
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+stream_interval: 2
+cuda_graph_config:
+  max_batch_size: 1024
+  enable_padding: true
+EOF
+```
+Explanation:
+- `stream_interval`: The iteration interval to create responses under the streaming mode.
+- `cuda_graph_config`: CUDA Graph config.
+  - `max_batch_size`: Max CUDA graph batch size to capture.
+  - `enable_padding`: Whether to enable CUDA graph padding.
+
+
+### Launch trtllm-serve OpenAI-compatible API server
+TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
+``` bash
+trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
+    --tp_size 8 \
+    --max_batch_size 1024 \
+    --trust_remote_code \
+    --num_postprocess_workers 2 \
+    --extra_llm_api_options ./extra-llm-api-config.yml
+```
+
+### Run performance benchmarks
+TensorRT-LLM provides a benchmark tool to benchmark `trtllm-serve`.
+
+Prepare a new terminal and run `benchmark_serving`.
+```bash
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model nvidia/Llama-3.3-70B-Instruct-FP8 \
+        --dataset-name random \
+        --ignore-eos \
+        --num-prompts 8192 \
+        --random-input-len 1024 \
+        --random-output-len 2048 \
+        --random-ids \
+        --max-concurrency 1024 \
 ```

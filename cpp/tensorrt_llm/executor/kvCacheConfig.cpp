@@ -26,8 +26,9 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     std::optional<SizeType32> const& sinkTokenLength, std::optional<FloatType> const& freeGpuMemoryFraction,
     std::optional<size_t> const& hostCacheSize, bool onboardBlocks,
     std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
-    size_t eventBufferMaxSize, std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults,
-    bool enablePartialReuse, bool copyOnPartialReuse)
+    size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
+    SizeType32 attentionDpEventsGatherPeriodMs,
+    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
     , mOnboardBlocks(onboardBlocks)
@@ -35,6 +36,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     , mEventBufferMaxSize{eventBufferMaxSize}
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
+    , mUseUvm{useUvm}
+    , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
 {
     if (maxTokens)
     {
@@ -60,6 +63,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     {
         fillEmptyFieldsFromRuntimeDefaults(runtimeDefaults.value());
     }
+    TLLM_CHECK_WITH_INFO(
+        mAttentionDpEventsGatherPeriodMs > 0, "Attention DP events gather period must be greater than 0");
 }
 
 bool KvCacheConfig::getEnableBlockReuse() const
@@ -120,6 +125,16 @@ std::optional<RetentionPriority> KvCacheConfig::getSecondaryOffloadMinPriority()
 size_t KvCacheConfig::getEventBufferMaxSize() const
 {
     return mEventBufferMaxSize;
+}
+
+bool KvCacheConfig::getUseUvm() const
+{
+    return mUseUvm;
+}
+
+SizeType32 KvCacheConfig::getAttentionDpEventsGatherPeriodMs() const
+{
+    return mAttentionDpEventsGatherPeriodMs;
 }
 
 void KvCacheConfig::setEnableBlockReuse(bool enableBlockReuse)
@@ -193,7 +208,18 @@ void KvCacheConfig::setEventBufferMaxSize(size_t eventBufferMaxSize)
     mEventBufferMaxSize = eventBufferMaxSize;
 }
 
-void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults runtimeDefaults)
+void KvCacheConfig::setUseUvm(bool useUvm)
+{
+    mUseUvm = useUvm;
+}
+
+void KvCacheConfig::setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs)
+{
+    TLLM_CHECK(attentionDpEventsGatherPeriodMs > 0);
+    mAttentionDpEventsGatherPeriodMs = attentionDpEventsGatherPeriodMs;
+}
+
+void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)
 {
     if (!mMaxAttentionWindowVec && runtimeDefaults.maxAttentionWindowVec)
     {

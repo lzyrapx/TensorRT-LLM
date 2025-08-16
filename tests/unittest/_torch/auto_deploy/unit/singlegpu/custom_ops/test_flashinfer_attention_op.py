@@ -1,5 +1,7 @@
+import flashinfer
 import pytest
 import torch
+from torch_attention_reference import TorchAttentionReference
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import _GlobalFlashInferPlanner
 
@@ -80,7 +82,14 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -90,6 +99,8 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
@@ -101,14 +112,19 @@ def test_flashinfer_attention_op_context(seq_length, n_heads, batch_size, dtype,
         1.0,
     )
 
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
-        k.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
-        v.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
-        is_causal=True,
+    # Use torch backend as clean reference
+    q_reshaped = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+    k_reshaped = k.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+    v_reshaped = v.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+
+    ref = TorchAttentionReference.basic_mha_with_cache(
+        q_reshaped,
+        k_reshaped,
+        v_reshaped,
+        k_cache,
+        v_cache,
+        torch.zeros(BATCH_SIZE, device=device, dtype=torch.int),
     )
-    ref = ref.transpose(1, 2).contiguous()
-    ref = ref.view(BATCH_SIZE, SEQ_LEN, N_HEADS * D_HEAD)
 
     assert torch.allclose(
         flashinfer_output.cpu().to(torch.float32),
@@ -196,7 +212,14 @@ def test_flashinfer_attention_op_decode(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -206,6 +229,8 @@ def test_flashinfer_attention_op_decode(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
@@ -242,12 +267,15 @@ def test_flashinfer_attention_op_decode(
         BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD
     )
 
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q_ref.transpose(1, 2), k_ref.transpose(1, 2), v_ref.transpose(1, 2)
+    # Use torch backend as clean reference for decode with prefilled cache
+    ref = TorchAttentionReference.decode_with_prefilled_cache(
+        q_ref,
+        k_ref,
+        v_ref,
+        k_cache,
+        v_cache,
+        torch.tensor([PREFILL_SEQ_LEN] * BATCH_SIZE, device=device, dtype=torch.int),
     )
-
-    ref = ref.transpose(1, 2).contiguous()
-    ref = ref.view(BATCH_SIZE, -1, N_HEADS * D_HEAD)
 
     assert torch.allclose(
         flashinfer_output.cpu().to(torch.float32),
@@ -303,8 +331,14 @@ def test_flashinfer_attention_context_and_generate(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    # Generate output
-    flashinfer_output_1 = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * PREFILL_SEQ_LEN,
+    )
+    flashinfer_output_1 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_1,
         k_1,
@@ -314,6 +348,8 @@ def test_flashinfer_attention_context_and_generate(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
@@ -330,15 +366,15 @@ def test_flashinfer_attention_context_and_generate(
     k_ref = k_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :]
     v_ref = v_cache[:BATCH_SIZE, 0:PREFILL_SEQ_LEN, :, :]
 
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q_ref.view(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD).transpose(1, 2),
-        k_ref.transpose(1, 2),
-        v_ref.transpose(1, 2),
-        is_causal=True,
+    # Use torch backend as clean reference
+    ref = TorchAttentionReference.basic_mha_with_cache(
+        q_ref.view(BATCH_SIZE, PREFILL_SEQ_LEN, N_HEADS, D_HEAD),
+        k_ref.transpose(1, 2).transpose(2, 3),  # Convert [B,N,S,D] to [B,S,N,D]
+        v_ref.transpose(1, 2).transpose(2, 3),  # Convert [B,N,S,D] to [B,S,N,D]
+        k_cache,
+        v_cache,
+        torch.zeros(BATCH_SIZE, device=device, dtype=torch.int),
     )
-
-    ref = ref.transpose(1, 2)
-    ref = ref[0:BATCH_SIZE, :PREFILL_SEQ_LEN, :, :]
     flashinfer_output_1 = flashinfer_output_1.view(BATCH_SIZE, -1, N_HEADS, D_HEAD)
 
     assert torch.allclose(
@@ -370,7 +406,14 @@ def test_flashinfer_attention_context_and_generate(
     # Create FlashInferAttention class before calling the custom op
     _GlobalFlashInferPlanner.reset()
 
-    flashinfer_output_3 = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * 1,
+    )
+    flashinfer_output_3 = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_3,
         k_3,
@@ -380,6 +423,8 @@ def test_flashinfer_attention_context_and_generate(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
@@ -415,7 +460,6 @@ def test_flashinfer_attention_context_and_generate(
     )
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5095416")
 @pytest.mark.parametrize(
     "seq",
     [
@@ -471,7 +515,14 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -481,6 +532,8 @@ def test_flashinfer_attention_op_context_input_pos(seq, batch_size, n_heads, dty
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
@@ -609,7 +662,14 @@ def test_flashinfer_attention_with_fp8_cache(
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    y = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -619,6 +679,8 @@ def test_flashinfer_attention_with_fp8_cache(
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
@@ -630,7 +692,7 @@ def test_flashinfer_attention_with_fp8_cache(
         V_SCALE,
     )
 
-    y = y.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
+    y = flashinfer_output.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
     q = q.view(BATCH_SIZE, SEQ_LEN, N_HEADS, D_HEAD)
 
     ref = _attention_with_fp8_kv_cache(
@@ -697,7 +759,14 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     _GlobalFlashInferPlanner.init_workspace(workspace)
 
-    flashinfer_output = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr, paged_kv_last_page_len, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * SEQ_LEN,
+    )
+    flashinfer_output = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q,
         k,
@@ -707,6 +776,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         paged_kv_indptr,
         paged_kv_indices,
         paged_kv_last_page_len,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,
@@ -771,7 +842,14 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
     # Create FlashInferAttention class before calling the custom op
     _GlobalFlashInferPlanner.reset()
 
-    flashinfer_output_gen = torch.ops.attention.flashinfer_mha_with_cache(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        qo_indptr2,
+        flashinfer.get_seq_lens(
+            paged_kv_indptr2, paged_kv_last_page_len2, page_size=k_cache.shape[1]
+        ),
+        BATCH_SIZE * 1,
+    )
+    flashinfer_output_gen = torch.ops.auto_deploy.flashinfer_attention_mha_with_cache(
         # Q, K, V
         q_gen,
         k_gen,
@@ -781,6 +859,8 @@ def test_flashinfer_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, de
         paged_kv_indptr2,
         paged_kv_indices2,
         paged_kv_last_page_len2,
+        batch_indices,
+        positions,
         # CACHES
         k_cache,
         v_cache,

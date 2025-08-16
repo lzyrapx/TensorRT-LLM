@@ -19,14 +19,17 @@
 
 #include "fp4GemmPlugin.h"
 #include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/kernels/internal_cutlass_kernels/include/fp4_gemm.h"
 
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
-using namespace tensorrt_llm::kernels::internal_cutlass_kernels;
 using tensorrt_llm::plugins::Fp4GemmPluginCreator;
 using tensorrt_llm::plugins::Fp4GemmPlugin;
 using tensorrt_llm::plugins::Fp4GemmPluginProfiler;
+#if defined(USING_OSS_CUTLASS_FP4_GEMM)
+using namespace tensorrt_llm::kernels::cutlass_kernels;
+#else
+using namespace tensorrt_llm::kernels::internal_cutlass_kernels;
+#endif
 
 constexpr nvinfer1::DataType FP4_DTYPE = nvinfer1::DataType::kFP4;
 constexpr nvinfer1::DataType FP8_DTYPE = nvinfer1::DataType::kFP8;

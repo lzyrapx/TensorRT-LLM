@@ -25,9 +25,19 @@ Welcome to TensorRT-LLM's Documentation!
 
    .. installation/overview.md
 
+   installation/containers.md
    installation/linux.md
    installation/build-from-source-linux.md
-   installation/grace-hopper.md
+
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Deployment Guide
+   :name: Deployment Guide
+
+   deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.md
+   deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.md
+   deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.md
 
 
 .. toctree::
@@ -75,10 +85,11 @@ Welcome to TensorRT-LLM's Documentation!
 .. toctree::
    :maxdepth: 2
    :caption: Command-Line Reference
-   :hidden:
+   :name: Command-Line Reference
 
+   commands/trtllm-bench
    commands/trtllm-build
-   commands/trtllm-serve
+   commands/trtllm-serve/index
 
 
 .. toctree::
@@ -104,6 +115,7 @@ Welcome to TensorRT-LLM's Documentation!
    advanced/inference-request.md
    advanced/lora.md
    advanced/expert-parallelism.md
+   advanced/kv-cache-management.md
    advanced/kv-cache-reuse.md
    advanced/speculative-decoding.md
    advanced/disaggregated-service.md
@@ -131,6 +143,8 @@ Welcome to TensorRT-LLM's Documentation!
 
    reference/precision.md
    reference/memory.md
+   reference/ci-overview.md
+   reference/dev-containers.md
 
 
 .. toctree::
@@ -143,6 +157,8 @@ Welcome to TensorRT-LLM's Documentation!
    blogs/Falcon180B-H200.md
    blogs/quantization-in-TRT-LLM.md
    blogs/XQA-kernel.md
+   blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md
+   blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.md
 
 
 Indices and tables

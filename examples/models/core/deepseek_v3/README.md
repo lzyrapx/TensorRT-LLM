@@ -1,7 +1,7 @@
 # DeepSeek‑V3 and DeepSeek-R1
 
 This guide walks you through the examples to run the DeepSeek‑V3/DeepSeek-R1 models using NVIDIA's TensorRT-LLM framework with the PyTorch backend.
-**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM, for brevity we only provide one model example, the example command to be used interchangeablely by only replacing the model name to the other one**.
+**DeepSeek-R1 and DeepSeek-V3 share exact same model architecture other than weights differences, and share same code path in TensorRT-LLM, for brevity we only provide one model example, the example command to be used interchangeably by only replacing the model name to the other one**.
 
 To benchmark the model with best configurations, refer to [DeepSeek R1 benchmarking blog](../../../../docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md).
 
@@ -21,9 +21,16 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
   - [Quick Start](#quick-start)
     - [Run a single inference](#run-a-single-inference)
     - [Multi-Token Prediction (MTP)](#multi-token-prediction-mtp)
+      - [Relaxed acceptance](#relaxed-acceptance)
     - [Long context support](#long-context-support)
+      - [ISL-64k-OSL-1024](#isl-64k-osl-1024)
+      - [ISL-128k-OSL-1024](#isl-128k-osl-1024)
   - [Evaluation](#evaluation)
   - [Serving](#serving)
+    - [trtllm-serve](#trtllm-serve)
+    - [Disaggregated Serving](#disaggregated-serving)
+    - [Dynamo](#dynamo)
+    - [tensorrtllm\_backend for triton inference server (Prototype)](#tensorrtllm_backend-for-triton-inference-server-prototype)
   - [Advanced Usages](#advanced-usages)
     - [Multi-node](#multi-node)
       - [mpirun](#mpirun)
@@ -32,21 +39,27 @@ Please refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/
     - [DeepGEMM](#deepgemm)
     - [FlashMLA](#flashmla)
     - [FP8 KV Cache and MLA](#fp8-kv-cache-and-mla)
+    - [W4AFP8](#w4afp8)
+      - [Activation calibration](#activation-calibration)
+      - [Weight quantization and assembling](#weight-quantization-and-assembling)
+    - [KV Cache Reuse](#kv-cache-reuse)
+    - [Chunked Prefill](#chunked-prefill)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
+  - [Known Issues](#known-issues)
 
 
 ## Hardware Requirements
 
 DeepSeek-v3 has 671B parameters which needs about 671GB GPU memory for FP8 weights, and needs more memories for activation tensors and KV cache.
-The minimum hardware requirements for running DeepSeek V3/R1 FP8&FP4 are listed as follows.
+The minimum hardware requirements for running DeepSeek V3/R1 at FP8/FP4/W4A8 are listed as follows.
 
-| GPU  | DeepSeek-V3/R1 FP8 | DeepSeek-V3/R1 FP4 |
-| -------- | ------- | -- |
-| H100 80GB | 16 | N/A |
-| H20 141GB | 8 | N/A |
-| H20 96GB | 8  | N/A |
-| H200 | 8     | N/A |
-| B200/GB200| Not supported yet, WIP | 4 (8 GPUs is recommended for best perf) |
+| GPU  | DeepSeek-V3/R1 FP8 | DeepSeek-V3/R1 FP4 | DeepSeek-V3/R1 W4A8 |
+| -------- | ------- | -- | -- |
+| H100 80GB | 16 | N/A | 8 |
+| H20 141GB | 8 | N/A | 4 |
+| H20 96GB | 8  | N/A | 4 |
+| H200 | 8     | N/A | 4 |
+| B200/GB200| Not supported yet, WIP | 4 (8 GPUs is recommended for best perf) | Not supported yet, WIP |
 
 Ampere architecture (SM80 & SM86) is not supported.
 
@@ -64,10 +77,10 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 ## Quick Start
 
 ### Run a single inference
-To quickly run DeepSeek-V3, [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
+To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../llm-api/quickstart_advanced.py):
 
 ```bash
-cd examples/pytorch
+cd examples/llm-api
 python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --tp_size 8
 ```
 
@@ -81,10 +94,10 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 ```
 
 ### Multi-Token Prediction (MTP)
-To run with MTP, use [examples/pytorch/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
+To run with MTP, use [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py) with additional options, see
 ```bash
-cd examples/pytorch
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
+cd examples/llm-api
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
@@ -110,13 +123,9 @@ When verifying and receiving draft tokens, there are two ways:
   Here is an example. We allow the first 15 (`--relaxed_topk 15`) tokens to be used as the initial candidate set, and use delta (`--relaxed_delta 0.5`) to filter out tokens with a large probability gap, which may be semantically different from the top-1 token.
 
   ```bash
-  cd examples/pytorch
-  python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
+  cd examples/llm-api
+  python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
   ```
-
-  Note: There are still compatibility issues between relaxed acceptance and attention_dp. These two flags cannot be enabled at the same time for now.
-
-
 
 ### Long context support
 DeepSeek-V3 model can support up to 128k context length. The following shows how to benchmark 64k and 128k input_seq_length using trtllm-bench on B200.
@@ -132,18 +141,15 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --num-requests 24 > /tmp/benchmarking_64k.txt
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
-pytorch_backend_config:
-  enable_overlap_scheduler: true
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes: [1, 4, 8, 12]
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 4, 8, 12]
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
         --tp 8 --ep 8 \
         --warmup 0 \
         --dataset /tmp/benchmarking_64k.txt \
-        --backend pytorch \
         --max_batch_size 12 \
         --max_num_tokens 65548 \
         --kv_cache_free_gpu_mem_fraction 0.6 \
@@ -161,19 +167,17 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
         --num-requests 4 > /tmp/benchmarking_128k.txt
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
-pytorch_backend_config:
-  enable_overlap_scheduler: true
-  use_cuda_graph: true
-  cuda_graph_padding_enabled: true
-  cuda_graph_batch_sizes: [1, 2]
-  moe_max_num_tokens: 16384
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2]
+moe_config:
+  max_num_tokens: 16384
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
         --tp 8 --ep 8 \
         --warmup 0 \
         --dataset /tmp/benchmarking_128k.txt \
-        --backend pytorch \
         --max_batch_size 2 \
         --max_num_tokens 131074 \
         --kv_cache_free_gpu_mem_fraction 0.3 \
@@ -187,9 +191,6 @@ Evaluate the model accuracy using `trtllm-eval`.
 1. (Optional) Prepare an advanced configuration file:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    enable_overlap_scheduler: true
 enable_attention_dp: true
 EOF
 ```
@@ -225,15 +226,17 @@ trtllm-eval --model  <YOUR_MODEL_DIR> \
 ```
 
 ## Serving
+### trtllm-serve
+
+Take max-throughput scenario on B200 as an example, the settings are extracted from the [blog](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.md#b200-max-throughput). **For users' own models and cases, the specific settings could be different to get best performance.**
 
 To serve the model using `trtllm-serve`:
 
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_padding_enabled: true
-    cuda_graph_batch_sizes:
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
     - 1
     - 2
     - 4
@@ -244,8 +247,7 @@ pytorch_backend_config:
     - 128
     - 256
     - 384
-    print_iter_log: true
-    enable_overlap_scheduler: true
+print_iter_log: true
 enable_attention_dp: true
 EOF
 
@@ -254,12 +256,12 @@ trtllm-serve \
   --host localhost \
   --port 8000 \
   --backend pytorch \
-  --max_batch_size 161 \
-  --max_num_tokens 1160 \
+  --max_batch_size 384 \
+  --max_num_tokens 1536 \
   --tp_size 8 \
   --ep_size 8 \
   --pp_size 1 \
-  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --kv_cache_free_gpu_memory_fraction 0.85 \
   --extra_llm_api_options ./extra-llm-api-config.yml
 ```
 
@@ -276,6 +278,139 @@ curl http://localhost:8000/v1/completions \
 ```
 
 For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
+
+### Disaggregated Serving
+
+To serve the model in disaggregated mode, you should launch context and generation servers using `trtllm-serve`.
+
+For example, you can launch a single context server on port 8001 with:
+
+```bash
+export TRTLLM_USE_UCX_KVCACHE=1
+
+cat >./ctx-extra-llm-api-config.yml <<EOF
+print_iter_log: true
+enable_attention_dp: true
+EOF
+
+trtllm-serve \
+  deepseek-ai/DeepSeek-V3 \
+  --host localhost \
+  --port 8001 \
+  --backend pytorch \
+  --max_batch_size 161 \
+  --max_num_tokens 1160 \
+  --tp_size 8 \
+  --ep_size 8 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --extra_llm_api_options ./ctx-extra-llm-api-config.yml &> output_ctx &
+```
+
+And you can launch two generation servers on port 8002 and 8003 with:
+
+```bash
+export TRTLLM_USE_UCX_KVCACHE=1
+
+cat >./gen-extra-llm-api-config.yml <<EOF
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 384
+print_iter_log: true
+enable_attention_dp: true
+EOF
+
+for port in {8002..8003}; do \
+trtllm-serve \
+  deepseek-ai/DeepSeek-V3 \
+  --host localhost \
+  --port ${port} \
+  --backend pytorch \
+  --max_batch_size 161 \
+  --max_num_tokens 1160 \
+  --tp_size 8 \
+  --ep_size 8 \
+  --pp_size 1 \
+  --kv_cache_free_gpu_memory_fraction 0.95 \
+  --extra_llm_api_options ./gen-extra-llm-api-config.yml \
+  &> output_gen_${port} & \
+done
+```
+
+Finally, you can launch the disaggregated server which will accept requests from the client and do
+the orchestration between the context and generation servers with:
+
+```bash
+cat >./disagg-config.yaml <<EOF
+hostname: localhost
+port: 8000
+backend: pytorch
+context_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 2
+  urls:
+      - "localhost:8002"
+      - "localhost:8003"
+EOF
+
+trtllm-serve disaggregated -c disagg-config.yaml
+```
+
+To query the server, you can start with a `curl` command:
+```bash
+curl http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+      "model": "deepseek-ai/DeepSeek-V3",
+      "prompt": "Where is New York?",
+      "max_tokens": 16,
+      "temperature": 0
+  }'
+```
+
+For DeepSeek-R1, use the model name `deepseek-ai/DeepSeek-R1`.
+
+Note that the optimal disaggregated serving configuration (i.e. tp/pp/ep mappings, number of ctx/gen instances, etc.) will depend
+on the request parameters, the number of concurrent requests and the GPU type. It is recommended to experiment to identify optimal
+settings for your specific use case.
+
+### Dynamo
+
+NVIDIA Dynamo is a high-throughput low-latency inference framework designed for serving generative AI and reasoning models in multi-node distributed environments.
+Dynamo supports TensorRT-LLM as one of its inference engine. For details on how to use TensorRT-LLM with Dynamo please refer to [LLM Deployment Examples using TensorRT-LLM](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/README.md)
+
+### tensorrtllm_backend for triton inference server (Prototype)
+To serve the model using [tensorrtllm_backend](https://github.com/triton-inference-server/tensorrtllm_backend.git), make sure the version is v0.19+ in which the pytorch path is added as a prototype feature.
+
+The model configuration file is located at https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/1/model.yaml
+
+```bash
+model: <replace with the deepseek model or path to the checkpoints>
+backend: "pytorch"
+```
+Additional configs similar to `extra-llm-api-config.yml` can be added to the yaml file and will be used to configure the LLM model. At the minimum, `tensor_parallel_size` needs to be set to 8 on H200 and B200 machines and 16 on H100.
+
+The initial loading of the model can take around one hour and the following runs will take advantage of the weight caching.
+
+To send requests to the server, try:
+```bash
+curl -X POST localhost:8000/v2/models/tensorrt_llm/generate -d '{"text_input": "Hello, my name is", "sampling_param_temperature":0.8, "sampling_param_top_p":0.95}' | sed 's/^data: //' | jq
+```
+Available parameters for the requests are listed in https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/all_models/llmapi/tensorrt_llm/config.pbtxt.
+
 
 ## Advanced Usages
 ### Multi-node
@@ -375,7 +510,7 @@ mpirun \
 -H <HOST1>:8,<HOST2>:8 \
 -mca plm_rsh_args "-p 2233" \
 --allow-run-as-root -n 16 \
-trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /models/DeepSeek-V3 throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/tensorrt_llm/dataset_isl1000.txt --tp 16 --ep 8 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options /workspace/tensorrt_llm/extra-llm-api-config.yml --concurrency 4096 --streaming
+trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /models/DeepSeek-V3 throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/tensorrt_llm/dataset_isl1000.txt --tp 16 --ep 8 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options /workspace/tensorrt_llm/extra-llm-api-config.yml --concurrency 4096 --streaming
 ```
 
 #### Slurm
@@ -387,7 +522,7 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   --container-image=<CONTAINER_IMG> \
   --container-mounts=/workspace:/workspace \
   --container-workdir /workspace \
-  bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+  bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 ```
 
 
@@ -401,10 +536,9 @@ python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
     --input-mean=1024 --output-mean=2048 --input-stdev=0 --output-stdev=0 > /tmp/dataset.txt
 
 cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_padding_enabled: true
-    cuda_graph_batch_sizes:
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
     - 1
     - 2
     - 4
@@ -415,8 +549,7 @@ pytorch_backend_config:
     - 128
     - 256
     - 384
-    print_iter_log: true
-    enable_overlap_scheduler: true
+print_iter_log: true
 enable_attention_dp: true
 EOF
 ```
@@ -457,7 +590,7 @@ DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1  # optional
 trtllm-llmapi-launch trtllm-bench \
     --model deepseek-ai/DeepSeek-R1 \
     --model_path $DS_R1_NVFP4_MODEL_PATH \
-    throughput --backend pytorch \
+    throughput \
     --num_requests 49152 \
     --max_batch_size 384 --max_num_tokens 1536 \
     --concurrency 3072 \
@@ -484,13 +617,31 @@ DeepGEMM-related behavior can be controlled by the following environment variabl
 | `TRTLLM_DG_JIT_USE_NVCC` | When set to `1`, use NVCC instead of NVRTC to compile the kernel, which has slightly better performance but requires CUDA Toolkit (>=12.3) and longer compilation time.|
 | `TRTLLM_DG_JIT_DUMP_CUBIN` | When set to `1`, dump the cubin file. This is only effective with NVRTC since NVCC will always dump the cubin file. NVRTC-based JIT will store the generated kernels in memory by default. If you want to persist the kernels across multiple runs, you can either use this variable or use NVCC. |
 
+#### MOE GEMM Optimization
+
+For Mixture of Experts (MOE) GEMM operations, TensorRT-LLM's DeepGEMM includes the optimized `fp8_gemm_kernel_swapAB` kernel. This kernel is automatically selected based on the input dimensions and GPU type:
+
+- On H20 GPUs (SM count = 78): Uses `fp8_gemm_kernel_swapAB` when the expected m_per_expert is less than 64
+- On H100/H200 GPUs: Uses `fp8_gemm_kernel_swapAB` when the expected m_per_expert is less than 32
+- Otherwise, uses the original `fp8_gemm_kernel`
+
+This automatic selection provides better performance for different workload sizes across various Hopper GPUs. In our test cases, the `fp8_gemm_kernel_swapAB` kernel achieves up to 1.8x speedup for individual kernels on H20 GPUs and up to 1.3x speedup on H100 GPUs.
+
+#### Dense GEMM Optimization
+
+The same optimization has been extended to Dense GEMM operations. For regular dense matrix multiplications:
+
+- On all Hopper GPUs (H20, H100, H200): Uses `fp8_gemm_kernel_swapAB` when the m is less than 32
+- Otherwise, uses the original `fp8_gemm_kernel`
+
+This optimization delivers significant performance improvements for small batch sizes. Our benchmarks show that the `fp8_gemm_kernel_swapAB` kernel achieves up to 1.7x speedup on H20 GPUs and up to 1.8x speedup on H100 GPUs for certain matrix dimensions.
+
 ```bash
 #single-node
 trtllm-bench \
       --model deepseek-ai/DeepSeek-V3 \
       --model_path /models/DeepSeek-V3 \
       throughput \
-      --backend pytorch \
       --max_batch_size ${MAX_BATCH_SIZE} \
       --max_num_tokens ${MAX_NUM_TOKENS} \
       --dataset dataset.txt \
@@ -512,7 +663,6 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
       --model deepseek-ai/DeepSeek-V3 \
       --model_path /models/DeepSeek-V3 \
       throughput \
-      --backend pytorch \
       --max_batch_size ${MAX_BATCH_SIZE} \
       --max_num_tokens ${MAX_NUM_TOKENS} \
       --dataset dataset.txt \
@@ -561,9 +711,88 @@ To enable FP8 MLA, modify the `kv_cache_quant_algo` property. The following show
 Alternatively, configure FP8 MLA through the `kv_cache_dtype` of the PyTorch backend config. An example is to use `--kv_cache_dtype` of `quickstart_advanced.py`. Also, you can edit `extra-llm-api-config.yml` consumed by `--extra_llm_api_options` of `trtllm-serve`, `trtllm-bench` and so on:
 ```yaml
 # ...
-pytorch_backend_config:
-  kv_cache_dtype: fp8
-  # ...
+kv_cache_dtype: fp8
+# ...
+```
+
+### W4AFP8
+
+TensorRT-LLM supports W(INT)4-A(FP)8 for DeepSeek on __Hopper__. Activations and weights are quantized at per-tensor and per-group (1x128) granularity respectively for MoE, and FP8 block scaling is preserved for dense layers.
+
+We provide a pre-quantized checkpoint for DeepSeek-R1 W4AFP8 at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8).
+
+```bash
+python quickstart_advanced.py --model_dir <W4AFP8 Checkpoint> --tp_size 8
+```
+Or you can follow the steps to generate one by yourselves.
+
+#### Activation calibration
+
+[ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) is used for calibrating activations of MoE layers. We provide a calibrated file at [HF model hub](https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main/act_scales.safetensors) or you can run the following commands to generate by yourselves.
+
+```bash
+# Make sure for enough GPU resources (8xH200s) to run the following commands
+PATH_OF_DEEPSEEK_R1=/llm-models/DeepSeek-R1/DeepSeek-R1
+
+# Install ModelOpt from source
+git clone https://github.com/NVIDIA/TensorRT-Model-Optimizer/ && cd modelopt
+pip install "nvidia-modelopt[all]" -U --extra-index-url https://pypi.nvidia.com
+
+# Clone DeepSeek-V3 (base model of R1) Github repository for FP8 inference,
+git clone https://github.com/deepseek-ai/DeepSeek-V3.git && cd DeepSeek-V3 && git checkout 1398800
+
+# Convert the HF checkpoint to a specific format for DeepSeek
+python inference/convert.py --hf-ckpt-path $PATH_OF_DEEPSEEK_R1 --save-path ds_r1 --n-experts 256 --model-parallel 8 && cd ..
+
+# Do per-tensor fp8 calibration
+torchrun --nproc-per-node 8 --master_port=12346 ptq.py --model_path DeepSeek-V3/ds_r1 --config DeepSeek-V3/inference/configs/config_671B.json --quant_cfg FP8_DEFAULT_CFG --output_path ds_r1_fp8_per_tensor_calibration && cd ../..
+```
+
+#### Weight quantization and assembling
+
+You can run the following bash to quantize weights and generate the full checkpoint.
+```bash
+#!/bin/bash
+HF_MODEL_DIR=/models/DeepSeek-R1/DeepSeek-R1/
+OUTPUT_DIR=/workspace/ckpt/
+# Safetensors or ModelOpt exported FP8 checkpoint path is accepted
+# e.g. ACT_SCALES=ds_r1_fp8_per_tensor_calibration
+ACT_SCALES=/workspace/act_scales.safetensors
+
+if [ ! -d "convert_logs" ]; then
+    mkdir convert_logs
+fi
+
+pids=()
+for i in 0 1 2 3 4 5 6 7
+do
+    python examples/quantization/quantize_mixed_precision_moe.py --model_dir $HF_MODEL_DIR --output_dir $OUTPUT_DIR --act_scales $ACT_SCALES --parts 9 --rank $i > convert_logs/log_$i 2>&1 &
+    pids+=($!)
+done
+
+python examples/quantization/quantize_mixed_precision_moe.py --model_dir $HF_MODEL_DIR --output_dir $OUTPUT_DIR --act_scales $ACT_SCALES --parts 9 --rank 8 > convert_logs/log_8 2>&1
+pids+=($!)
+
+for pid in ${pids[@]}; do
+    wait $pid
+done
+
+echo "All processes completed!"
+```
+
+The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by other commands.
+
+### KV Cache Reuse
+KV cache reuse is supported for MLA on SM90 and SM100. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
+
+### Chunked Prefill
+Chunked Prefill is supported for MLA only on SM90 and SM100 currently. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
+
+More specifically, we can imitate what we did in the [Quick Start](#quick-start):
+
+``` bash
+cd examples/llm-api
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --enable_chunked_prefill
 ```
 
 ## Notes and Troubleshooting
@@ -572,7 +801,3 @@ pytorch_backend_config:
 - **GPU Memory:** Adjust `--max_batch_size` and `--max_num_tokens` if you encounter out-of-memory errors.
 - **Logs:** Check `/workspace/trt_bench.log` for detailed performance information and troubleshooting messages.
 - **Configuration Files:** Verify that the configuration files are correctly formatted to avoid runtime issues.
-
-## Known Issues
-
-- MTP + attention DP + CUDA graph + overlap scheduler might have accuracy issues. We'll fix it later.

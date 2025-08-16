@@ -79,7 +79,7 @@ that have been validated extensively and is the same listing as seen on the
 - [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
 - [meta-llama/Llama-3.1-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct)
 - [meta-llama/Llama-3.1-405B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct)
-- [mistralai/Mixtral-8x7B-v0.1-Instruct](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct)
+- [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1)
 
 ```{tip}
 `trtllm-bench` can automatically download the model from Hugging Face Model Hub.
@@ -234,15 +234,6 @@ The following command builds an FP8 quantized engine by specifying the engine tu
 
 ```shell
 trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_len 4096 --max_batch_size 1024 --max_num_tokens 2048
-```
-
-- [Experimental] Build engine with target ISL/OSL for optimization:
-In this experimental mode, you can provide hints to `trtllm-bench`'s tuning heuristic to optimize the engine on specific ISL and OSL targets.
-Generally, the target ISL and OSL aligns with the average ISL and OSL of the dataset, but you can experiment with different values to optimize the engine using this mode.
-The following command builds an FP8 quantized engine and optimizes for ISL:OSL targets of 128:128.
-
-```shell
-trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_len 4096 --target_isl 128 --target_osl 128
 ```
 
 
@@ -438,7 +429,7 @@ for build heuristics.
 ```
 
 ```shell
-trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --backend pytorch
+trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt
 
 # Example output
 <snip verbose logging>
@@ -475,6 +466,83 @@ Total Latency (ms):             18563.6825
 
 ```
 
+#### Benchmarking with LoRA Adapters in PyTorch workflow
+
+The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapters. This requires preparing a dataset with LoRA metadata and configuring the LoRA settings.
+
+**Preparing LoRA Dataset**
+
+Use `prepare_dataset.py` with LoRA-specific options to generate requests with LoRA metadata:
+
+```shell
+python3 benchmarks/cpp/prepare_dataset.py \
+  --stdout \
+  --rand-task-id 0 1 \
+  --tokenizer /path/to/tokenizer \
+  --lora-dir /path/to/loras \
+  token-norm-dist \
+  --num-requests 100 \
+  --input-mean 128 \
+  --output-mean 128 \
+  --input-stdev 16 \
+  --output-stdev 24 \
+  > synthetic_lora_data.json
+```
+
+Key LoRA options:
+- `--lora-dir`: Parent directory containing LoRA adapter subdirectories named by their task IDs (e.g., `0/`, `1/`, etc.)
+- `--rand-task-id`: Range of LoRA task IDs to randomly assign to requests
+- `--task-id`: Fixed LoRA task ID for all requests (alternative to `--rand-task-id`)
+
+The generated dataset will include LoRA request metadata. Below is an example of a single such request data entry:
+
+```json
+{
+  "task_id": 0,
+  "input_ids": [3452, 88226, 102415, ...],
+  "output_tokens": 152,
+  "lora_request": {
+    "lora_name": "lora_0",
+    "lora_int_id": 0,
+    "lora_path": "/path/to/loras/0"
+  }
+}
+```
+
+**LoRA Configuration**
+
+Create an `extra-llm-api-options.yaml` file with LoRA configuration:
+
+```yaml
+lora_config:
+  lora_dir:
+    - /path/to/loras/0
+    - /path/to/loras/1
+  max_lora_rank: 64
+  lora_target_modules:
+    - attn_q
+    - attn_k
+    - attn_v
+  trtllm_modules_to_hf_modules:
+    attn_q: q_proj
+    attn_k: k_proj
+    attn_v: v_proj
+```
+
+**Running LoRA Benchmark**
+
+```shell
+trtllm-bench --model /path/to/base/model \
+  throughput \
+  --dataset synthetic_lora_data.json \
+  --extra_llm_api_options extra-llm-api-options.yaml
+```
+
+```{note}
+The LoRA directory structure should have task-specific subdirectories named by their task IDs (e.g., `loras/0/`, `loras/1/`).
+Each subdirectory should contain the LoRA adapter files for that specific task.
+```
+
 #### Running multi-modal models in the PyTorch Workflow
 
 To benchmark multi-modal models with PyTorch workflow, you can follow the similar approach as above.
@@ -508,7 +576,6 @@ Run the benchmark:
 trtllm-bench --model Qwen/Qwen2-VL-2B-Instruct \
   throughput \
   --dataset mm_data.jsonl \
-  --backend pytorch \
   --num_requests 10 \
   --max_batch_size 4 \
   --modality image
@@ -609,6 +676,7 @@ above:
         "quant_algo": "FP8",
         "kv_cache_quant_algo": null
     }
+}
 ```
 
 The checkpoints above are quantized to run with a compute precision of `FP8` and default to no KV cache quantization (full
@@ -628,8 +696,7 @@ If you would like to force the KV cache quantizaton, you can specify the followi
 when the checkpoint precision is `null`:
 
 ```yaml
-pytorch_backend_config:
-  kv_cache_dtype: "fp8"
+kv_cache_dtype: "fp8"
 ```
 
 ```{tip}

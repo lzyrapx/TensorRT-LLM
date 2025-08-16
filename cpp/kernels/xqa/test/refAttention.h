@@ -12,6 +12,7 @@
 
 #pragma once
 
+#define EIGEN_STACK_ALLOCATION_LIMIT (1U << 20)
 #include "../mha.h"
 #include <Eigen/Dense>
 
@@ -49,7 +50,11 @@ struct CacheSeq<true, false>
     GMemCacheHead const& operator[](uint32_t i) const
     {
         uint32_t const pageIdx = pageIndices[i / tokensPerPage];
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+        return pool[nbHeads * tokensPerPage * pageIdx + (i % tokensPerPage) * nbHeads + idxHead];
+#else
         return pool[tokensPerPage * nbHeads * pageIdx + tokensPerPage * idxHead + i % tokensPerPage];
+#endif
     }
 
     GMemCacheHead const* pool;
@@ -78,17 +83,17 @@ struct CacheSeq<true, true>
 template <typename MathElem, uint32_t tileSize, bool isPaged, bool useBeamSearch>
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize);
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks);
 
 template <typename MathElem, bool isPaged, bool useBeamSearch>
 #if SPEC_DEC
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len);
+    float kvScale, float xScale, uint32_t slidingWinSize, bool* hostMask, const uint32_t qSeqLen, const uint32_t q_len);
 #else
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize);
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks);
 #endif
 
 template <uint32_t ropeStyle>

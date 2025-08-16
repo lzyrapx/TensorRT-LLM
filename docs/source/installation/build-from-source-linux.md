@@ -2,11 +2,14 @@
 
 # Building from Source Code on Linux
 
-This document provides instructions for building TensorRT-LLM from source code on Linux. Building from source code is necessary if you want the best performance or debugging capabilities, or if the [GNU C++11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) is required.
+This document provides instructions for building TensorRT-LLM from source code on Linux. Building from source is recommended for achieving optimal performance, enabling debugging capabilities, or when you need a different [GNU CXX11 ABI](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html) configuration than what is available in the pre-built TensorRT-LLM wheel on PyPI. Note that the current pre-built TensorRT-LLM wheel on PyPI is linked against PyTorch 2.7.0 and subsequent versions, which uses the new CXX11 ABI.
+
 
 ## Prerequisites
 
 Use [Docker](https://www.docker.com) to build and run TensorRT-LLM. Instructions to install an environment to run Docker containers for the NVIDIA platform can be found [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
+
+If you intend to build any TensortRT-LLM artifacts, such as any of the container images (note that there exist pre-built [develop](#build-from-source-tip-develop-container) and [release](#build-from-source-tip-release-container) container images in NGC), or the TensorRT-LLM Python wheel, you first need to clone the TensorRT-LLM repository:
 
 ```bash
 # TensorRT-LLM uses git-lfs, which needs to be installed in advance.
@@ -24,6 +27,11 @@ git lfs pull
 There are two options to create a TensorRT-LLM Docker image. The approximate disk space required to build the image is 63 GB.
 
 ### Option 1: Build TensorRT-LLM in One Step
+
+```{tip}
+:name: build-from-source-tip-release-container
+If you just want to run TensorRT-LLM, you can instead [use the pre-built TensorRT-LLM Release container images](containers).
+```
 
 TensorRT-LLM contains a simple command to create a Docker image. Note that if you plan to develop on TensorRT-LLM, we recommend using [Option 2: Build TensorRT-LLM Step-By-Step](#option-2-build-tensorrt-llm-step-by-step).
 
@@ -48,11 +56,16 @@ The `make` command supports the `LOCAL_USER=1` argument to switch to the local u
 
 Since TensorRT-LLM has been built and installed, you can skip the remaining steps.
 
-### Option 2: Build TensorRT-LLM Step-by-Step
+### Option 2: Container for building TensorRT-LLM Step-by-Step
 
 If you are looking for more flexibility, TensorRT-LLM has commands to create and run a development container in which TensorRT-LLM can be built.
 
-#### Create the Container
+```{tip}
+:name: build-from-source-tip-develop-container
+As an alternative to building the container image following the instructions below,
+you can pull a pre-built [TensorRT-LLM Develop container image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel) from NGC (see [here](containers) for information on container tags).
+Follow the linked catalog entry to enter a new container based on the pre-built container image, with the TensorRT source repository mounted into it. You can then skip this section and continue straight to [building TensorRT-LLM](#build-tensorrt-llm).
+```
 
 **On systems with GNU `make`**
 
@@ -98,6 +111,11 @@ If you are looking for more flexibility, TensorRT-LLM has commands to create and
     Note: please make sure to set `--ipc=host` as a docker run argument to avoid `Bus error (core dumped)`.
 
 Once inside the container, follow the next steps to build TensorRT-LLM from source.
+
+### Advanced topics
+
+For more information on building and running various TensorRT-LLM container images,
+check <https://github.com/NVIDIA/TensorRT-LLM/tree/main/docker>.
 
 ## Build TensorRT-LLM
 
@@ -149,7 +167,7 @@ Refer to the {ref}`support-matrix-hardware` section for a list of architectures.
 
 #### Building the Python Bindings for the C++ Runtime
 
-The C++ Runtime, in particular, `GptSession` can be exposed to Python via bindings. This feature can be turned on through the default build options.
+The C++ Runtime can be exposed to Python via bindings. This feature can be turned on through the default build options.
 
 ```bash
 python3 ./scripts/build_wheel.py
@@ -169,8 +187,7 @@ The `build_wheel.py` script will also compile the library containing the C++ run
 python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real" --cpp_only --clean
 ```
 
-This is particularly useful to avoid linking problems which may be introduced by particular versions of `torch` related to the [dual ABI support of GCC](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html). The option `--clean` will remove the build directory before building. The default build directory is `cpp/build`, which may be overridden using the option
-`--build_dir`. Run `build_wheel.py --help` for an overview of all supported options.
+This is particularly useful for avoiding linking issues that may arise with older versions of `torch` (prior to 2.7.0) due to the [Dual ABI support in GCC](https://gcc.gnu.org/onlinedocs/libstdc++/manual/using_dual_abi.html). The `--clean` option removes the build directory before starting a new build. By default, TensorRT-LLM uses `cpp/build` as the build directory, but you can specify a different location with the `--build_dir` option. For a complete list of available build options, run `python3 ./scripts/build_wheel.py --help`.
 
 The shared library can be found in the following location:
 
@@ -207,7 +224,7 @@ Alternatively, you can use editable installation for convenience during Python d
 TRTLLM_USE_PRECOMPILED=1 pip install -e .
 ```
 
-Setting `TRTLLM_USE_PRECOMPILED=1` enables downloading a prebuilt wheel of the version specified in `tensorrt_llm/version.py`, extracting compiled libraries into your current directory, thus skipping C++ compilation.
+Setting `TRTLLM_USE_PRECOMPILED=1` enables downloading a prebuilt wheel of the version specified in `tensorrt_llm/version.py`, extracting compiled libraries into your current directory, thus skipping C++ compilation. This version can be overridden by specifying `TRTLLM_USE_PRECOMPILED=x.y.z`.
 
 You can specify a custom URL or local path for downloading using `TRTLLM_PRECOMPILED_LOCATION`. For example, to use version 0.16.0 from PyPI:
 
@@ -216,7 +233,5 @@ TRTLLM_PRECOMPILED_LOCATION=https://pypi.nvidia.com/tensorrt-llm/tensorrt_llm-0.
 ```
 
 #### Known Limitations
-
-Currently, our released TensorRT-LLM wheel packages are linked against public PyTorch hosted on PyPI, which disables C++11 ABI support. However, the Docker image built previously is based on an NGC container where PyTorch has C++11 ABI enabled; see [NGC PyTorch container page](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch). Therefore, we recommend performing a full build inside this container.
 
 When using `TRTLLM_PRECOMPILED_LOCATION`, ensure that your wheel is compiled based on the same version of C++ code as your current directory; any discrepancies may lead to compatibility issues.

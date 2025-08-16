@@ -12,9 +12,11 @@
 
 #include "cuda_hint.cuh"
 #include "defines.h"
+#if !(IS_MLA)
 #include "ldgsts.cuh"
 #include "mha.h"
 #include "mhaUtils.cuh"
+#include "mha_components.cuh"
 #include "mma.cuh"
 #include "utils.cuh"
 
@@ -135,12 +137,10 @@ __device__ inline uint32_t gemm1WarpIdxInGrp(uint32_t warpIdxX)
 constexpr uint32_t instM = 16;
 constexpr uint32_t instN = 8;
 // constexpr uint32_t instK = 16;
-constexpr uint32_t quadPerWarp = warp_size / 4;
 
-using QuadRegRowMax
-    = Vec<float, divUp(warpTile.y, warp_size) * 4>;             // data is replicated across 4 threads in a MMA quad.
-using ThrdRegRowMax = Vec<float, divUp(warpTile.y, warp_size)>; // unlike QuadRegRowMax, not replicated.
-using UniformRescaleMask = Vec<uint32_t, divUp(warpTile.y, warp_size)>; // uniform and stored in UR
+using QuadRegRowMax = QuadRegRowMaxT<warpTile.y>;           // data is replicated across 4 threads in a MMA quad.
+using ThrdRegRowMax = ThrdRegRowMaxT<warpTile.y>;           // unlike QuadRegRowMax, not replicated.
+using UniformRescaleMask = UniformRescaleMaskT<warpTile.y>; // uniform and stored in UR
 
 __device__ inline bool any(UniformRescaleMask const& x)
 {
@@ -319,32 +319,6 @@ struct alignas(16) SMemWarpRowMax
     float data[ThrdRegRowMax::size][quadPerWarp][4];
 };
 
-// idxMat8 is the reduced row index in 8-row unit.
-__device__ inline float replicateValForQuad(Warp const& warp, ThrdRegRowMax const& src, uint32_t idxMat8)
-{
-    assertWarpConverged();
-    uint32_t const i = idxMat8 / 4;
-    uint32_t const j = idxMat8 % 4;
-    return __shfl_sync(~0U, src[i], quadPerWarp * j + laneId() / 4);
-}
-
-__device__ inline QuadRegRowMax replicateForQuad(Warp const& warp, ThrdRegRowMax const& src)
-{
-    assertWarpConverged();
-    QuadRegRowMax dst;
-#pragma unroll
-    for (uint32_t i = 0; i < src.size; i++)
-    {
-#pragma unroll
-        for (uint32_t j = 0; j < 4; j++)
-        {
-            dst[i * 4 + j] = __shfl_sync(~0U, src[i], quadPerWarp * j + laneId() / 4);
-            assert(dst[i * 4 + j] == replicateValForQuad(warp, src, i * 4 + j));
-        }
-    }
-    return dst;
-}
-
 // cacheVTileSeqLen may be smaller than x cols, so we need multiple v tiles per X tile.
 constexpr uint32_t nbCacheVTilesPerXTile = exactDiv(warpTile.x, cacheVTileSeqLen);
 
@@ -481,36 +455,7 @@ __device__ inline void smemRotateInplace(Warp const& Warp, Array2D<LdGrain, rows
 }
 #endif
 
-using InstAcc = Array2D<float, 2, 2>;
-using WarpAcc = Array2D<InstAcc, exactDiv(warpTile.y, instM), exactDiv(warpTile.x, instN)>;
-
-__device__ inline void applyMask(Warp const& warp, WarpAcc& acc, uint32_t validColBeg, uint32_t validColEnd)
-{
-    uint32_t const idxInQuad = laneId() % 4;
-    uint32_t const idxQuad = laneId() / 4;
-#pragma unroll
-    for (uint32_t n = 0; n < acc.cols; n++)
-    {
-#pragma unroll
-        for (uint32_t j = 0; j < InstAcc::cols; j++)
-        {
-            uint32_t const col = instN * n + InstAcc::cols * idxInQuad + j;
-            if (col >= validColBeg && col < validColEnd)
-            {
-                continue;
-            }
-#pragma unroll
-            for (uint32_t m = 0; m < acc.rows; m++)
-            {
-#pragma unroll
-                for (uint32_t i = 0; i < InstAcc::rows; i++)
-                {
-                    acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
-                }
-            }
-        }
-    }
-}
+using WarpAcc = WarpAccT<warpTile.y, warpTile.x>;
 
 #if SPEC_DEC
 #define MMAS_N_PER_MASK 2
@@ -1434,6 +1379,19 @@ __device__ inline ThrdRegRowMax mergeRowMax(
     return mergedRowMax;
 }
 
+__device__ inline void addAttentionSinks(
+    ThrdRegRowMax& globalRowSum, ThrdRegRowMax const globalRowMax, float const* attentionSinks)
+{
+    for (uint32_t i = 0; i < globalRowSum.size; i++)
+    {
+        uint32_t srcOffset = warp_size * i + laneId();
+        if (srcOffset < headGrpSize)
+        {
+            globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+        }
+    }
+}
+
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -1460,6 +1418,7 @@ CUBIN_EXPORT __global__
 #if SPEC_DEC
         MaskType const* __restrict__ mask,  // [qSeqLen, divUp(qSeqLen, 32)].
 #endif
+        float const* attentionSinks,        // [headGrpSize]
 #ifdef NDEBUG
         KVCacheList<usePagedKVCache> const& cacheList,
 #if BEAM_WIDTH > 1
@@ -1482,7 +1441,6 @@ CUBIN_EXPORT __global__
     uint32_t const idxSubSeqInSeq = allowMultiBlockMode ? blockIdx.x : 0;
     assert(!isMultiBlock || (semaphores != nullptr && scratch != nullptr));
 
-    static_assert(inputSeqLen == 1);
     // gridDim: x - K/V sequence-dim split; y - number of K or V heads per token; z - number of requests
     assert(gridDim.z == batchSize && gridDim.y == nbKHeads);
     extern __shared__ char smemByteBuf[];
@@ -1571,7 +1529,7 @@ CUBIN_EXPORT __global__
 #endif
     __syncthreads();
 
-#if ENABLE_FDL
+#if ENABLE_PDL
     preExit();
     acqBulk();
 #endif
@@ -1648,7 +1606,6 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
-    static_assert(!(allowSlidingWindow && useSpecDec), "Sliding window is not yet supported in spec-dec mode");
 #if SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
@@ -1665,7 +1622,7 @@ CUBIN_EXPORT __global__
 
     uint32_t const nbSeqIters = useKVCache ? divUp(cacheSeqLen, ctaTile.x) : 0;
 #if SPEC_DEC
-    uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - qSeqLen) / ctaTile.x;
+    uint32_t const nbSeqItersWithoutMask = (cacheSeqLen - actualQSeqLen) / ctaTile.x;
 #endif
 
     uint32_t const seqStrideIters = nbSubSeqPerSeq;
@@ -1728,17 +1685,33 @@ CUBIN_EXPORT __global__
             uint32_t const dstHeadOffset = 0;
             uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+            uint32_t const idxHeadBeg = (seqOffset % tokensPerPage) * nbKHeads + idxHeadGrp;
+
+#else
             uint32_t const idxHeadBeg = tokensPerPage * idxHeadGrp + seqOffset % tokensPerPage;
+#endif
 #if BEAM_WIDTH == 1
+#if PAGED_KV_CACHE_LAYOUT == 1
+            HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
+                cacheList.kCacheVLLM, pageIdx, nbKHeads, idxHeadBeg};
+#else
             HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
                 cacheList.pool, pageIdx, nbKHeads, idxHeadBeg};
+#endif
 #else
-            IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
+            IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src
+            {
                 /*indices=*/smem.gemm0CacheIndir[warpIdx.x].data,
-                /*pool=*/cacheList.pool,
-                /*pageIndices=*/smem.kCachePages[warpIdx.x].data,
-                /*nbKHeads=*/nbKHeads,
-                /*offset=*/idxHeadBeg};
+#if PAGED_KV_CACHE_LAYOUT == 1
+                    /*pool=*/cacheList.kCacheVLLM,
+#else
+                    /*pool=*/cacheList.pool,
+#endif
+                    /*pageIndices=*/smem.kCachePages[warpIdx.x].data,
+                    /*nbKHeads=*/nbKHeads,
+                    /*offset=*/idxHeadBeg
+            };
 #endif
 #else
             uint32_t const idxHeadBeg = cacheKSeqBaseOffset + seqOffset;
@@ -2047,17 +2020,33 @@ CUBIN_EXPORT __global__
                   uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter
                       + cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx;
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+                  uint32_t const idxHeadBeg = (seqOffset % tokensPerPage) * nbKHeads + idxHeadGrp;
+
+#else
                   uint32_t const idxHeadBeg = tokensPerPage * idxHeadGrp + seqOffset % tokensPerPage;
+#endif
 #if BEAM_WIDTH == 1
+#if PAGED_KV_CACHE_LAYOUT == 1
+                  HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
+                      cacheList.vCacheVLLM, pageIdx, nbKHeads, idxHeadBeg};
+#else
                   HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
                       cacheList.pool, pageIdx, nbKHeads, idxHeadBeg};
+#endif
 #else
-                  IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
+                  IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src
+                  {
                       /*indices=*/smem.gemm1CacheIndir[grpLoadV ? warpGrpIdx : warpIdx.x].data,
-                      /*pool=*/cacheList.pool,
-                      /*pageIndices=*/smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x].data,
-                      /*nbKHeads=*/nbKHeads,
-                      /*offset=*/idxHeadBeg};
+#if PAGED_KV_CACHE_LAYOUT == 1
+                          /*pool=*/cacheList.vCacheVLLM,
+#else
+                          /*pool=*/cacheList.pool,
+#endif
+                          /*pageIndices=*/smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x].data,
+                          /*nbKHeads=*/nbKHeads,
+                          /*offset=*/idxHeadBeg
+                  };
 #endif
 #else
                   uint32_t const idxHeadBeg = cacheVSeqBaseOffset + seqOffset;
@@ -2396,6 +2385,12 @@ CUBIN_EXPORT __global__
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
         if (seqIterInit < nbSeqIters)
         { // otherwise rcpRowSum will be NAN.
+            // The attention sinks are moved to the multi-block reduction part if the multi-block is enabled.
+            if (!isMultiBlock && attentionSinks != nullptr)
+            {
+                // Attention sinks are per head.
+                addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+            }
             ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
 #if LOW_PREC_OUTPUT
             voScale *= rcpOutScale[0];
@@ -2584,6 +2579,11 @@ CUBIN_EXPORT __global__
                         assert(std::isfinite(mergedRowSum[0]));
                     }
                 }
+                if (attentionSinks != nullptr)
+                {
+                    // Attention sinks are per head.
+                    addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+                }
                 __syncthreads();
                 rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
                 GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
@@ -2640,6 +2640,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     MaskType const* __restrict__ mask,  // [qSeqLen, divUp(qSeqLen, 32))] uint2 (each bit represents mask for one col
                                         // position).
 #endif
+    float const* attentionSinks,        // [headGrpSize]
     KVCacheList<usePagedKVCache> const cacheList,
 #if BEAM_WIDTH > 1
     BeamSearchParams const beamSearchParams,
@@ -2665,7 +2666,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
         mask,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
@@ -2692,8 +2693,13 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
     InputHead const* q,
 #endif
+    float const* attentionSinks, // [headGrpSize]
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
 #else
@@ -2756,10 +2762,14 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     dim3 const dimGrid{nbSubSeqPerSeq, nbKHeads, batchSize};
 #endif
     dim3 const dimCta{warp_size * ctaShapeInWarps.x, ctaShapeInWarps.y, ctaShapeInWarps.z};
-    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_FDL != 0);
+    auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
+#if PAGED_KV_CACHE_LAYOUT == 1
+    KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#else
     KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#endif
     cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
         qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -2777,7 +2787,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
         mask,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
@@ -2805,7 +2815,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
         mask,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
@@ -2814,4 +2824,5 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     checkCuda(cudaPeekAtLastError());
 #endif // USE_INPUT_KV
 }
+#endif
 #endif

@@ -4,9 +4,8 @@ from pathlib import Path
 import pytest
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 
@@ -22,12 +21,10 @@ def model_path():
     return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):
+def create_llm(model_dir, disable_overlap_scheduler, sampler_type):
     """Create LLM with specific overlap scheduler setting"""
-    pytorch_config = PyTorchConfig(
-        use_cuda_graph=True,
-        enable_overlap_scheduler=enable_overlap_scheduler,
-        enable_trtllm_decoder=enable_trtllm_decoder)
+    pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
+                          sampler_type=sampler_type)
 
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
@@ -36,33 +33,35 @@ def create_llm(model_dir, enable_overlap_scheduler, enable_trtllm_decoder):
         tensor_parallel_size=1,
         trust_remote_code=True,
         enable_chunked_prefill=True,
-        pytorch_backend_config=pytorch_config,
+        cuda_graph_config=CudaGraphConfig(),
+        **pytorch_config,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=
         128  # Only one request longer than max_num_tokens is required to test chunked prefill
     )
 
 
-@pytest.mark.parametrize("enable_trtllm_decoder", [False])
-def test_overlap_scheduler_consistency(model_path, test_case,
-                                       enable_trtllm_decoder):
+@pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
+@pytest.mark.high_cuda_memory
+def test_overlap_scheduler_consistency(model_path, test_case, sampler_type):
     # Test configuration
     prompts = test_case["prompts"]
     max_new_tokens = test_case["max_new_tokens"]
     temperature = test_case["temperature"]
     top_p = test_case["top_p"]
-    stop_words = test_case["stop_words"] if enable_trtllm_decoder else None
+    stop_words = test_case["stop_words"]
 
     sampling_config = SamplingParams(max_tokens=max_new_tokens,
-                                     beam_width=1,
                                      stop=stop_words,
                                      temperature=temperature,
-                                     top_p=top_p)
+                                     top_p=top_p,
+                                     n=1,
+                                     use_beam_search=True)
 
     # Test with overlap scheduler enabled
     llm = create_llm(model_path,
-                     enable_overlap_scheduler=True,
-                     enable_trtllm_decoder=enable_trtllm_decoder)
+                     disable_overlap_scheduler=False,
+                     sampler_type=sampler_type)
     outputs_with_overlap = llm.generate(prompts,
                                         sampling_params=sampling_config,
                                         use_tqdm=True)
@@ -73,8 +72,8 @@ def test_overlap_scheduler_consistency(model_path, test_case,
 
     # Test with overlap scheduler disabled
     llm = create_llm(model_path,
-                     enable_overlap_scheduler=False,
-                     enable_trtllm_decoder=enable_trtllm_decoder)
+                     disable_overlap_scheduler=True,
+                     sampler_type=sampler_type)
     outputs_without_overlap = llm.generate(prompts,
                                            sampling_params=sampling_config,
                                            use_tqdm=True)

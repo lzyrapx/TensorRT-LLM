@@ -26,7 +26,7 @@
 #include "tensorrt_llm/runtime/rawEngine.h"
 #include "tensorrt_llm/runtime/tllmLogger.h"
 #include "tensorrt_llm/runtime/utils/numpyUtils.h"
-#include "tensorrt_llm/runtime/utils/sessionUtils.h"
+#include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -160,11 +160,9 @@ void runEncoderTest(std::unique_ptr<BufferManager>& bufferManager, ModelConfig c
         requestList.push_back(request);
     }
 
-    TrtGptModelOptionalParams optionalParams;
     tensorrt_llm::executor::ExecutorConfig executorConfig{};
-    optionalParams.schedulerConfig = executorConfig.getSchedulerConfig();
     auto trtEncoderModel = std::make_shared<TrtEncoderModel>(
-        modelConfig, worldConfig, runtime::RawEngine(engineBuffer.data(), engineBuffer.size()), logger, optionalParams);
+        modelConfig, worldConfig, runtime::RawEngine(engineBuffer.data(), engineBuffer.size()), logger, executorConfig);
 
     trtEncoderModel->forward(requestList);
 

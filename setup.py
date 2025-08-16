@@ -31,7 +31,8 @@ def parse_requirements(filename: os.PathLike):
         extra_URLs = []
         deps = []
         for line in requirements:
-            if line.startswith("#") or line.startswith("-r"):
+            if line.startswith("#") or line.startswith("-r") or line.startswith(
+                    "-c"):
                 continue
 
             # handle -i and --extra-index-url options
@@ -48,9 +49,9 @@ def parse_requirements(filename: os.PathLike):
 
 
 def sanity_check():
-    bindings_path = Path(
-        __file__).resolve().parent / "tensorrt_llm" / "bindings"
-    if not bindings_path.exists():
+    tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
+    if not ((tensorrt_llm_path / "bindings").exists() or
+            (tensorrt_llm_path / "bindings.pyi").exists()):
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -87,6 +88,10 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+constraints_file = Path("constraints.txt")
+if constraints_file.exists():
+    constraints, _ = parse_requirements(constraints_file)
+    required_deps.extend(constraints)
 
 if on_windows:
     package_data = [
@@ -98,7 +103,12 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
-        'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
+        'libs/libtensorrt_llm_nixl_wrapper.so',
+        'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
+        'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
+        'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
+        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
+        'deep_gemm/LICENSE', 'deep_gemm/include/**/*', 'deep_gemm_cpp_tllm.*.so'
     ]
 
 package_data += [
@@ -106,17 +116,18 @@ package_data += [
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
+    "_torch/auto_deploy/config/*.yaml",
 ]
 
 
-def download_precompiled(workspace: str) -> str:
+def download_precompiled(workspace: str, version: str) -> str:
     import glob
     import subprocess
 
     from setuptools.errors import SetupError
 
     cmd = [
-        "pip", "download", f"tensorrt_llm={get_version()}",
+        "python3", "-m", "pip", "download", f"tensorrt_llm=={version}",
         f"--dest={workspace}", "--no-deps",
         "--extra-index-url=https://pypi.nvidia.com"
     ]
@@ -176,7 +187,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
-            if file.filename.endswith(".py"):
+            if file.filename.endswith((".py", ".yaml")):
                 continue
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,
@@ -190,17 +201,18 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
             wheel.extract(file)
 
 
-use_precompiled: bool = os.getenv("TRTLLM_USE_PRECOMPILED") == "1"
-precompiled_location: str = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
-
-if precompiled_location:
-    use_precompiled = True
+precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
+precompiled_location: str | None = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
+use_precompiled: bool = (precompiled is not None
+                         and precompiled != "0") or (precompiled_location
+                                                     is not None)
 
 if use_precompiled:
     from tempfile import TemporaryDirectory
     with TemporaryDirectory() as tempdir:
         if not precompiled_location:
-            precompiled_location = download_precompiled(tempdir)
+            version = precompiled if precompiled != "1" else get_version()
+            precompiled_location = download_precompiled(tempdir, version)
         extract_from_precompiled(precompiled_location, package_data, tempdir)
 
 sanity_check()

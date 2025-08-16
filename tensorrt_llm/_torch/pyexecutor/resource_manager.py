@@ -1,19 +1,24 @@
+import copy
+import enum
 import math
 from abc import ABC, abstractmethod
-from collections import OrderedDict
-from typing import Dict, List, Optional, Union
+from collections import OrderedDict, defaultdict
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import nvtx_range
+from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
-from ...mapping import Mapping
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from ...mapping import CpType, Mapping
+from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
+                          get_draft_token_length)
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -21,8 +26,9 @@ if ENABLE_MULTI_DEVICE:
 
     from tensorrt_llm._utils import mpi_comm
 
+BufferManagerCpp = tensorrt_llm.bindings.internal.runtime.BufferManager
 KVCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
-KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
+KvCacheConfigCpp = tensorrt_llm.bindings.executor.KvCacheConfig
 CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
 ModelConfig = tensorrt_llm.bindings.ModelConfig
 DataType = tensorrt_llm.bindings.DataType
@@ -30,6 +36,19 @@ KVCacheEventManagerCpp = tensorrt_llm.bindings.internal.batch_manager.KVCacheEve
 RequestList = list[LlmRequest]
 PeftCacheManagerCpp = tensorrt_llm.bindings.internal.batch_manager.PeftCacheManager
 PeftCacheConfig = tensorrt_llm.bindings.executor.PeftCacheConfig
+WorldConfig = tensorrt_llm.bindings.WorldConfig
+TempAttentionWindowInputs = tensorrt_llm.bindings.internal.batch_manager.TempAttentionWindowInputs
+BlocksPerWindow = Dict[int, Tuple[
+    int,
+    int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
+
+
+class ResourceManagerType(enum.Enum):
+    KV_CACHE_MANAGER = "KV_CACHE_MANAGER"
+    DRAFT_KV_CACHE_MANAGER = "DRAFT_KV_CACHE_MANAGER"
+    PEFT_CACHE_MANAGER = "PEFT_CACHE_MANAGER"
+    SEQ_SLOT_MANAGER = "SEQ_SLOT_MANAGER"
+    SPEC_RESOURCE_MANAGER = "SPEC_RESOURCE_MANAGER"
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -46,6 +65,9 @@ class BaseResourceManager(ABC):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         raise NotImplementedError
 
+    def add_dummy_requests(self, request_ids: List[int]):
+        pass
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
 
@@ -57,6 +79,63 @@ class BaseResourceManager(ABC):
 
     def shutdown(self):
         pass
+
+
+def get_pp_layers(
+    num_layers: int,
+    mapping: Mapping,
+    spec_config: Optional["DecodingBaseConfig"] = None,
+    layer_mask: Optional[List[bool]] = None,
+) -> Tuple[List[int], int]:
+    from ..speculative.utils import get_num_spec_layers
+
+    total_num_layers = num_layers
+    if layer_mask is not None:
+        assert sum(layer_mask) == num_layers, (
+            f"The number of enabled layers in layer_mask ({sum(layer_mask)}) "
+            f"must match the number of layers ({num_layers}) "
+            f"in KV cache manager, but get layer_mask: {layer_mask}")
+        total_num_layers = len(layer_mask)
+    pp_layers = mapping.pp_layers(total_num_layers)
+    if layer_mask is not None:
+        pp_layers = [i for i in pp_layers if layer_mask[i]]
+    if spec_config is not None:
+        num_spec_layers = get_num_spec_layers(spec_config)
+        total_num_layers += num_spec_layers
+        if mapping.is_last_pp_rank():
+            pp_layers.extend(
+                range(total_num_layers - num_spec_layers, total_num_layers))
+    if len(pp_layers) == 0:
+        # Don't support empty KV cache for now, provide at least 1 layer
+        pp_layers.append(0)
+    return pp_layers, total_num_layers
+
+
+def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
+
+    class RequestContext:
+
+        def __init__(self, is_draft: bool,
+                     scheduled_requests: ScheduledRequests):
+            self.is_draft = is_draft
+            self.scheduled_requests = scheduled_requests
+
+        def __enter__(self):
+            if not self.is_draft:
+                return
+
+            for req in self.scheduled_requests.all_requests():
+                req.use_draft_model = True
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if not self.is_draft:
+                return
+
+            # Clean up the state
+            for req in self.scheduled_requests.all_requests():
+                req.use_draft_model = False
+
+    return RequestContext(is_draft, scheduled_requests)
 
 
 class KVCacheManager(BaseResourceManager):
@@ -76,14 +155,28 @@ class KVCacheManager(BaseResourceManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: DataType = DataType.HALF,
-        # Some speculative decoding methods need to use different kv lengths for the
-        # draft/target layers. Add extra tokens to haddle this issue.
-        num_extra_kv_tokens: int = 0,
+        spec_config: Optional["DecodingBaseConfig"] = None,
+        layer_mask: Optional[List[bool]] = None,
+        max_num_tokens: int = 8192,
+        model_config: Optional[ModelConfig] = None,
+        max_beam_width: int = 1,
+        is_draft: bool = False,
     ) -> None:
-        self.num_layers = num_layers
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        self.pp_layers, self.num_layers = get_pp_layers(
+            num_layers,
+            mapping,
+            spec_config=spec_config,
+            layer_mask=layer_mask,
+        )
+        self.is_draft = is_draft
+        self.num_local_layers = len(self.pp_layers)
+        self.layer_offsets = {
+            idx: offset
+            for offset, idx in enumerate(self.pp_layers)
+        }
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -92,24 +185,35 @@ class KVCacheManager(BaseResourceManager):
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
                 (num_kv_heads + tp_size - 1) // tp_size
-                for _ in range(num_layers)
+                for _ in range(self.num_local_layers)
             ]
-
+            self.total_num_kv_heads_per_layer = [
+                (num_kv_heads + tp_size - 1) // tp_size
+                for _ in range(self.num_layers)
+            ]
         else:
             assert len(num_kv_heads) == self.num_layers
 
-            self.num_kv_heads_per_layer = []
-            for layer_idx, kv_head in enumerate(num_kv_heads):
+            def append_to_kv_heads_per_layer(num_kv_heads_per_layer: List[int],
+                                             kv_head: Optional[int]):
                 if kv_head is not None:
-                    self.num_kv_heads_per_layer.append(
+                    num_kv_heads_per_layer.append(
                         (kv_head + tp_size - 1) // tp_size)
                 else:
-                    self.num_kv_heads_per_layer.append(0)
+                    num_kv_heads_per_layer.append(0)
 
-        assert len(self.num_kv_heads_per_layer) > 0
+            self.num_kv_heads_per_layer = []
+            if self.num_local_layers > 0:
+                for i in self.pp_layers:
+                    kv_head = num_kv_heads[i]
+                    append_to_kv_heads_per_layer(self.num_kv_heads_per_layer,
+                                                 kv_head)
 
-        self.is_homongenous = all(val == self.num_kv_heads_per_layer[0]
-                                  for val in self.num_kv_heads_per_layer[1:])
+            self.total_num_kv_heads_per_layer = []
+            for i in range(self.num_layers):
+                kv_head = num_kv_heads[i]
+                append_to_kv_heads_per_layer(self.total_num_kv_heads_per_layer,
+                                             kv_head)
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -117,45 +221,92 @@ class KVCacheManager(BaseResourceManager):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
-        self.num_extra_kv_tokens = num_extra_kv_tokens
+        # Some speculative decoding methods need to use different kv lengths for the
+        # draft/target layers. Add extra tokens to handle this issue.
+        # Import here to avoid circular imports
+        from ..speculative import get_num_extra_kv_tokens
+        self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
+        self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
+        self.max_num_tokens = max_num_tokens
 
+        # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
-            max_attention_window = max_seq_len
+            # Use max_seq_len as default max_attention_window
+            self.max_attention_window_vec = [max_seq_len]
         else:
-            assert len(
-                kv_cache_config.max_attention_window
-            ) == 1, "Python KvCacheManager doesn't currently support variable window attention"
-            max_attention_window = kv_cache_config.max_attention_window[0]
+            self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
+            )  # Make a copy to avoid modifying original
+
+            # Clamp all window sizes to max_seq_len before calculating the
+            # number of KV cache blocks. This prevents the KV cache pool from
+            # being skewed by the largest window values.
+            self.max_attention_window_vec = [
+                min(max_seq_len, w) for w in self.max_attention_window_vec
+            ]
 
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
                              else 0)
 
-        self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
-            kv_cache_config,
-            head_dim=head_dim,
+        # Determine if this is VSWA (Variable Sliding Window Attention)
+        self.is_vswa = len(self.max_attention_window_vec) > 1
+
+        # Calculate blocks per window using appropriate method
+        if self.is_vswa:
+            # VSWA case: use C++ implementation for variable window sizes
+            # model config check
+            if model_config is None:
+                raise ValueError(
+                    "model_config is required for VSWA (Variable Sliding Window Attention)"
+                )
+            # kv cache config check
+            assert isinstance(
+                kv_cache_config, KvCacheConfigCpp
+            ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp"
+            blocks_per_window = self.calculate_max_num_blocks_from_cpp(
+                kv_cache_config=kv_cache_config,
+                model_config=model_config,
+                extra_cost_memory=0,
+            )
+        else:
+            # Standard case: use original Python implementation
+            self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
+                kv_cache_config=kv_cache_config,
+                head_dim=head_dim,
+                tokens_per_block=tokens_per_block,
+                mapping=mapping,
+                dtype=dtype,
+                kv_factor=self.kv_factor,
+            )
+            blocks_per_window = {
+                self.max_attention_window_vec[0]:
+                (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
+            }
+
+        # Validate and adjust attention windows against their upper bounds if needed
+        blocks_per_window, self.max_seq_len, self.max_attention_window_vec = self._validate_and_adjust_attention_windows(
+            max_attention_window_vec=self.max_attention_window_vec,
+            blocks_per_window=blocks_per_window,
             tokens_per_block=tokens_per_block,
-            mapping=mapping,
-            dtype=dtype,
-            kv_factor=self.kv_factor,
+            sink_token_length=sink_token_length,
+            max_seq_len=self.max_seq_len,
+            max_beam_width=max_beam_width,
         )
 
-        max_atten_window_upper_bound = self.get_max_atten_window_upper_bound(
-            blocks_in_primary_pool=self.blocks_in_primary_pool,
-            tokens_per_block=tokens_per_block,
-            max_beam_width=1,
-            sink_token_len=sink_token_length,
-            max_seq_len=max_seq_len)
-
-        if max_attention_window > max_atten_window_upper_bound:
-            logger.warning(
-                f"maxAttentionWindow and maxSequenceLen are too large for at least one sequence to fit in kvCache. They are reduced to {max_atten_window_upper_bound}"
+        if kv_cache_type != CacheTypeCpp.SELF:
+            assert len(
+                blocks_per_window
+            ) == 1, "Only one window size is supported for non-self KV cache"
+            # rewrite the attention window size in blocks_per_window
+            memory_pools = blocks_per_window[self.max_attention_window_vec[0]]
+            blocks_per_window = {self.max_seq_len: memory_pools}
+            logger.info(
+                f"Adjusted attention window size to {self.max_seq_len} in blocks_per_window"
             )
-            max_attention_window = max_atten_window_upper_bound
-            self.max_seq_len = max_atten_window_upper_bound
 
-        self.max_attention_window = max_attention_window if kv_cache_type == CacheTypeCpp.SELF else self.max_seq_len
+        # Set up temp_attention_window_inputs
+        temp_attention_window_inputs = self._set_temp_attention_window_inputs()
 
         # Note that this stream is unused for now. Will be used for copying to host
         # when that feature is enabled.
@@ -164,12 +315,11 @@ class KVCacheManager(BaseResourceManager):
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
             'tokens_per_block': tokens_per_block,
-            'blocks_in_primary_pool': self.blocks_in_primary_pool,
-            'blocks_in_secondary_pool': self.blocks_in_secondary_pool,
+            'blocks_per_window': blocks_per_window,
             'max_num_sequences': max_batch_size,
-            'max_beam_width': 1,  # TODO: more than 1 beam?
-            'max_attention_window_vec': [self.max_attention_window],
-            'temp_attention_window_inputs': None,
+            'max_beam_width': max_beam_width,
+            'max_attention_window_vec': self.max_attention_window_vec,
+            'temp_attention_window_inputs': temp_attention_window_inputs,
             'dtype': dtype,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
@@ -181,8 +331,17 @@ class KVCacheManager(BaseResourceManager):
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
         if self.event_buffer_max_size > 0:
-            kwargs['event_manager'] = KVCacheEventManagerCpp(
-                max_kv_event_entries=self.event_buffer_max_size)
+            if mapping.enable_attention_dp:
+                kwargs['event_manager'] = KVCacheEventManagerCpp(
+                    max_kv_event_entries=self.event_buffer_max_size,
+                    attention_dp_rank=mapping.rank,
+                    attention_dp_size=mapping.world_size,
+                    attention_dp_events_gather_period_ms=self.
+                    attention_dp_events_gather_period_ms,
+                )
+            else:
+                kwargs['event_manager'] = KVCacheEventManagerCpp(
+                    max_kv_event_entries=self.event_buffer_max_size)
 
         self.impl = KVCacheManagerCpp(**kwargs)
 
@@ -237,71 +396,93 @@ class KVCacheManager(BaseResourceManager):
         return need_blocks
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests
-        generation_batch = scheduled_batch.generation_requests
-        # allocate KV Cache
-        for req in context_batch:
-            req_beam_width = 1  # req.sampling_config.beam_width
-            if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
-                    'cp_type']:
-                if req.ctx_iters == 0:
-                    seq_len = sum(
-                        len(ctx_block) for ctx_block in req.ctx_blocks)
-                    self.impl.add_sequence(
-                        req.py_request_id,
-                        seq_len + (len(req.query_id) if self.mapping.cp_rank
-                                   == self.mapping.cp_size - 1 else 0),
-                        req_beam_width, req)
-            else:
-                if req.is_first_context_chunk():
-                    self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                           req_beam_width, req)
-                    for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req.py_request_id)
-                    if req.py_draft_tokens is not None:
-                        for _ in range(len(req.py_draft_tokens)):
+        with request_context(self.is_draft, scheduled_batch):
+            context_batch = scheduled_batch.context_requests
+            generation_batch = scheduled_batch.generation_requests
+            # allocate KV Cache
+            for req in context_batch:
+                req_beam_width = req.sampling_config.beam_width
+                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
+                        'cp_type']:
+                    if req.ctx_iters == 0:
+                        seq_len = sum(
+                            len(ctx_block) for ctx_block in req.ctx_blocks)
+                        self.impl.add_sequence(
+                            req.py_request_id,
+                            seq_len + (len(req.query_id) if self.mapping.cp_rank
+                                       == self.mapping.cp_size - 1 else 0),
+                            req_beam_width, req)
+                else:
+                    if req.is_first_context_chunk:
+                        self.impl.add_sequence(req.py_request_id,
+                                               req.prompt_len, req_beam_width,
+                                               req)
+                        for _ in range(self.num_extra_kv_tokens):
+                            self.impl.add_token(req.py_request_id)
+                        for _ in range(get_draft_token_length(req)):
                             self.impl.add_token(req.py_request_id)
 
-        for req in generation_batch:
-            self.impl.add_token(req.py_request_id)
-            if req.py_draft_tokens is not None:
-                for _ in range(len(req.py_draft_tokens)):
+            for req in generation_batch:
+                self.impl.add_token(req.py_request_id)
+                for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
         self,
         request_ids: List[int],
+        # Note that token_nums should be past_kv_len + input_len (without
+        # spec decoding). The draft tokens will be added in this function,
+        # so we don't need to take care of it in the caller. When preparing
+        # token_nums, we should not take the draft tokens into account, so
+        # don't use the kv_cache_manager.max_seq_len, which includes both
+        # extra tokens and draft tokens.
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
+        use_mrope: bool = False,
+        max_beam_width: int = 1,
     ):
-        beam_width = 1
+        beam_width = max_beam_width
         requests = []
         for i, req_id in enumerate(request_ids):
-            sampling_params = SamplingParams()
+            # exact choice of n can be ignored for dummy requests
+            sampling_params = SamplingParams(n=beam_width,
+                                             best_of=beam_width,
+                                             use_beam_search=beam_width > 1)
+            # Here 1+max_num_draft_tokens is used to extend the prompt length to
+            # a non-zero number to skip illegal memory access issue in MLA kernel
+            # during warmup.
             token_num = token_nums[
                 i] if token_nums is not None else 1 + max_num_draft_tokens
             encoder_input_tokens = [
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
+            mrope_position_deltas = torch.zeros(
+                1, device="cuda", dtype=torch.int32) if use_mrope else None
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
                              input_tokens=[1] * token_num,
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
+                             mrope_position_deltas=mrope_position_deltas,
                              encoder_input_tokens=encoder_input_tokens)
+            req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
+                for _ in range(self.num_extra_kv_tokens):
+                    self.impl.add_token(req_id)
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
-                req.prompt_len = token_num - 1 + max_num_draft_tokens
+                req.prompt_len = token_num - 1
                 req.py_prompt_len = req.prompt_len
-                if max_num_draft_tokens > 0:
-                    req.py_draft_tokens = [0] * max_num_draft_tokens
+                req.py_draft_tokens = [1] * max_num_draft_tokens
+                if prepare_resource:
+                    for _ in range(max_num_draft_tokens):
+                        self.impl.add_token(req_id)
             requests.append(req)
         return requests
 
@@ -311,6 +492,10 @@ class KVCacheManager(BaseResourceManager):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
+
+        # For context requests, we store the blocks for reuse.
+        for request in scheduled_batch.context_requests:
+            self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
@@ -329,14 +514,10 @@ class KVCacheManager(BaseResourceManager):
         cache_size_per_token = kv_factor * sum(
             self.num_kv_heads_per_layer) * head_dim
 
-        if dtype == DataType.FP8:
-            kv_cache_dtype_bytes = 1
-        elif dtype in (DataType.HALF, DataType.BF16):
-            kv_cache_dtype_bytes = 2
-        elif dtype == DataType.FLOAT:
-            kv_cache_dtype_bytes = 4
-        else:
+        if dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
+                         DataType.FLOAT):
             raise ValueError(f'Cannot support {dtype} KV cache.')
+        kv_cache_dtype_bytes = binding_dtype_size(dtype)
 
         cache_size_bytes_per_token = cache_size_per_token * kv_cache_dtype_bytes
         free_mem, total_mem = torch.cuda.mem_get_info()
@@ -354,6 +535,9 @@ class KVCacheManager(BaseResourceManager):
                 )
             else:
                 max_tokens = kv_cache_config.max_tokens
+                logger.info(
+                    f"max_tokens is set by kv_cache_config.max_tokens: {max_tokens}"
+                )
 
         if mapping.world_size > 1:
             # make sure all ranks use same value for maxTokens
@@ -374,7 +558,7 @@ class KVCacheManager(BaseResourceManager):
         token_capacity = blocks_in_primary_pool * tokens_per_block
         max_blocks_per_seq = math.floor(token_capacity /
                                         (max_beam_width * tokens_per_block))
-        assert max_blocks_per_seq > 0, "Impossibe to fit in any sequence in kvCache"
+        assert max_blocks_per_seq > 0, "Impossible to fit in any sequence in kvCache"
 
         max_token_num = max_blocks_per_seq * tokens_per_block
         sink_tokens_in_last_block = sink_token_len % tokens_per_block
@@ -385,36 +569,60 @@ class KVCacheManager(BaseResourceManager):
         assert max_atten_window_upper_bound > 0, "Impossibe to fit in any sequence in kvCache"
         return max_atten_window_upper_bound
 
-    def get_cache_indices(self, request: LlmRequest) -> List[int]:
+    def get_cache_indices(self,
+                          request: LlmRequest,
+                          window_size: Optional[int] = None) -> List[int]:
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
         result = self.impl.get_cache_block_ids(request.py_request_id,
-                                               self.max_attention_window)
+                                               window_size)
         assert len(result) == 1
         return result[0]
 
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
-    ) -> Dict[int, List[int]]:
-        result = self.impl.get_batch_cache_block_ids(request_ids,
-                                                     self.max_attention_window)
+        window_size: Optional[int] = None,
+    ) -> List[List[int]]:
+        if window_size is None:
+            if len(self.max_attention_window_vec) > 1:
+                raise ValueError("window_size must be provided for VSWA")
+            window_size = self.max_attention_window_vec[0]
+
+        result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
             assert (len(result[i])) == 1
             result[i] = result[i][0]
         return result
 
     def get_num_free_blocks(self) -> int:
-        return self.impl.get_kv_cache_stats().free_num_blocks
+        if self.is_vswa:
+            logger.info(
+                f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
+            )
+            return min(self.impl.get_kv_cache_stats().
+                       num_free_blocks_per_window_size.values())
+        else:
+            return self.impl.get_kv_cache_stats().free_num_blocks
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
 
+    def get_num_available_tokens(self, max_num_draft_tokens: int = 0) -> int:
+        return (self.get_num_free_blocks() * self.tokens_per_block -
+                self.num_extra_kv_tokens - max_num_draft_tokens)
+
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
-        result = self.impl.get_primary_pool_data(layer_idx)
+        layer_offset = self.layer_offsets[layer_idx]
+        result = self.impl.get_primary_pool_data(layer_offset)
         return result.reshape(
             result.shape[0],
             self.kv_factor,
             self.tokens_per_block,
-            self.num_kv_heads_per_layer[layer_idx],
+            self.num_kv_heads_per_layer[layer_offset],
             self.head_dim,
         )
 
@@ -440,207 +648,287 @@ class KVCacheManager(BaseResourceManager):
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
 
+    def _get_window_size_to_layers(self) -> dict[int, list[int]]:
+        """
+        Get the window size to layers mapping.
+        The returned map has window sizes as keys and lists of layer indices as values.
 
-class MambaCacheManager(BaseResourceManager):
+        max_attention_window_vec is treated as a repeating pattern.
+        """
+        window_size_to_layers_map = defaultdict(list)
 
-    def __init__(self, d_model: int, d_state: int, d_conv: int, expand: int,
-                 n_groups: int, head_dim: int, num_layers: int,
-                 max_batch_size: int, mapping: Mapping,
-                 conv1d_state_dtype: torch.dtype) -> None:
+        if not self.max_attention_window_vec:
+            # This case should ideally be prevented by earlier config validation.
+            # If num_local_layers is 0, an empty map is fine.
+            if self.num_local_layers > 0:
+                raise Exception(
+                    "max_attention_window_vec cannot be empty if there are local layers."
+                )
+            return {
+            }  # Return an empty dict if no local layers or if somehow vec is empty and no layers.
 
-        # get tp size
-        tp_size = mapping.tp_size
+        # Treat max_attention_window_vec as a repeating pattern.
+        pattern_len = len(
+            self.max_attention_window_vec
+        )  # `sliding_window_pattern`, in HF config terms, e.g. https://huggingface.co/google/gemma-3-1b-it/blob/main/config.json#L32
+        # early return if max_attention_window_vec is a single value(SWA)
+        if pattern_len == 1:
+            return {
+                self.max_attention_window_vec[0]:
+                list(range(self.num_local_layers))
+            }
+        for local_layer_idx in range(self.num_local_layers):
+            window_size = self.max_attention_window_vec[local_layer_idx %
+                                                        pattern_len]
+            window_size_to_layers_map[window_size].append(local_layer_idx)
+        return window_size_to_layers_map
 
-        # derive mamba parameters for conv and ssm states
-        d_inner = d_model * expand
-        conv_dim = d_inner + 2 * n_groups * d_state
-        nheads = d_inner // head_dim
-
-        # check that can be partitioned
-        assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
-        assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
-
-        # partition conv_dim and nheads
-        conv_dim = conv_dim // tp_size
-        nheads = nheads // tp_size
-
-        # conv and ssm states device
-        device = torch.device("cuda")
-
-        # mamba conv states
-        self.conv_states = torch.empty(
-            size=[
-                num_layers,
-                max_batch_size,
-                conv_dim,
-                d_conv,
-            ],
-            dtype=conv1d_state_dtype,
-            device=device,
-        )
-
-        # mamba ssm states
-        self.ssm_states = torch.empty(
-            size=[
-                num_layers,
-                max_batch_size,
-                nheads,
-                d_state,
-                head_dim,
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
-
-        # mamba cache available blocks
-        self.mamba_cache_free_blocks = [i for i in range(max_batch_size)]
-
-        # mamba cache index, maps request_id -> state indices
-        self.mamba_cache_index: Dict[int, int] = {}
-
-        # mamba cache state indices
-        self.state_indices: torch.Tensor = torch.Tensor()
-
-    def prepare_mamba_cache_blocks(self, request_ids: List[int]):
-        state_indices = []
-        for r in request_ids:
-            # cache hit
-            if r in self.mamba_cache_index:
-                state_indices.append(self.mamba_cache_index[r])
-            # cache miss
-            else:
-                if len(self.mamba_cache_free_blocks) == 0:
-                    raise Exception("run out of mamba cache blocks")
-                block = self.mamba_cache_free_blocks.pop()
-                self.mamba_cache_index[r] = block
-                state_indices.append(block)
-        self.state_indices = torch.as_tensor(state_indices, dtype=torch.long)
-
-    def free_mamba_cache_blocks(self, request_id: int):
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
-            self.mamba_cache_free_blocks.append(block)
-
-    def prepare_mamba_resources(self, scheduled_batch: ScheduledRequests):
-        context_ids = [
-            i.py_request_id for i in scheduled_batch.context_requests
-        ]
-        generation_ids = [
-            i.py_request_id for i in scheduled_batch.generation_requests
-        ]
-        request_ids = context_ids + generation_ids
-        self.prepare_mamba_cache_blocks(request_ids)
-
-    def free_mamba_resources(self, request: LlmRequest):
-        self.free_mamba_cache_blocks(request.py_request_id)
-
-    def get_state_indices(self) -> torch.Tensor:
-        return self.state_indices
-
-    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        return self.conv_states[layer_idx]
-
-    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        return self.ssm_states[layer_idx]
-
-
-class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
-
-    def __init__(
-        self,
-        # mamba cache parameters
-        mamba_d_model: int,
-        mamba_d_state: int,
-        mamba_d_conv: int,
-        mamba_expand: int,
-        mamba_n_groups: int,
-        mamba_head_dim: int,
-        mamba_num_layers: int,
-        mamba_conv1d_state_dtype: torch.dtype,
-        # kv cache parameters
+    @staticmethod
+    def adjust_window_sizes_for_vswa(
+        window_size_to_layers: Dict[int, List[int]],
         kv_cache_config: KvCacheConfigCpp,
-        kv_cache_type: CacheTypeCpp,
-        *,
-        num_layers: int,
-        num_kv_heads: Union[int, List[Optional[int]]],
-        head_dim: int,
+        model_config: ModelConfig,
+        pool_memory_bytes: int,
+        kv_factor: int,
+        dtype: DataType,
+        is_cross_attention: bool = False,
+    ) -> Dict[int, List[int]]:
+
+        assert is_cross_attention is False, 'Cross attention is not supported'
+
+        max_tokens_from_config = kv_cache_config.max_tokens
+
+        def calculate_cache_size_per_token(layers: Set[int]) -> int:
+            # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
+            total_kv_heads = sum(model_config.num_kv_heads_per_layer[i]
+                                 for i in layers)
+            return total_kv_heads * kv_factor * model_config.head_size
+
+        # Calculate the required memory bytes per sequence.
+        required_mem_bytes_per_seq = 0
+        for window_size in sorted(window_size_to_layers):
+            layers = window_size_to_layers[window_size]
+            cache_size_per_token = calculate_cache_size_per_token(layers)
+            cache_size_bytes_per_token = cache_size_per_token * binding_dtype_size(
+                dtype)
+            required_mem_bytes_per_seq += window_size * cache_size_bytes_per_token
+        logger.debug(
+            f'Required memory per sequence: {required_mem_bytes_per_seq} bytes')
+
+        if required_mem_bytes_per_seq < pool_memory_bytes:
+            # No need to adjust the window sizes.
+            return copy.deepcopy(window_size_to_layers)
+
+        logger.debug(
+            f'Adjusting the window sizes {list(window_size_to_layers)} to fit '
+            f'the memory {pool_memory_bytes} bytes.')
+        adjusted_window_size_to_layers = {}
+
+        remaining_mem_bytes = pool_memory_bytes
+        remaining_layers = set(i for layers in window_size_to_layers.values()
+                               for i in layers)
+
+        accum_max_tokens = 0
+        prev_window_size = 0
+
+        for window_size in sorted(window_size_to_layers):
+            layers = window_size_to_layers[window_size]
+            if remaining_mem_bytes > 0 and remaining_layers:
+                # Calculate cache size per token for remaining layers only
+                cache_size_per_token = calculate_cache_size_per_token(
+                    remaining_layers)
+                cache_size_bytes_per_token = cache_size_per_token * binding_dtype_size(
+                    dtype)
+                logger.debug(
+                    f'Cache size per token for {len(remaining_layers)} layers: '
+                    f'{cache_size_bytes_per_token} bytes')
+                # Calculate max tokens that can fit in this window with remaining memory.
+                max_tokens_in_window = min(
+                    remaining_mem_bytes // cache_size_bytes_per_token,
+                    window_size - prev_window_size)
+                remaining_mem_bytes -= max_tokens_in_window * cache_size_bytes_per_token
+                accum_max_tokens += max_tokens_in_window
+                logger.debug(f'Remaining memory: {remaining_mem_bytes} bytes')
+                logger.debug(
+                    f'Max token of window {window_size}: {accum_max_tokens}')
+
+                if accum_max_tokens < window_size:
+                    logger.debug(
+                        f'Max tokens ({accum_max_tokens}) cannot fill the current window ({window_size}). '
+                        f'The larger windows will have the same max tokens.')
+                    remaining_mem_bytes = 0
+
+                # Clamp the sequence length if provided explicitly.
+                if max_tokens_from_config is not None:
+                    accum_max_tokens = min(max_tokens_from_config,
+                                           accum_max_tokens)
+                    # If max tokens from config is reached, stop allocating
+                    # more memory. Since the maximum number of tokens is
+                    # already reached, for the remaining windows maxTokens
+                    # will be set by the current value of accumMaxTokens.
+                    if accum_max_tokens == max_tokens_from_config:
+                        remaining_mem_bytes = 0
+
+            if accum_max_tokens not in adjusted_window_size_to_layers:
+                adjusted_window_size_to_layers[accum_max_tokens] = layers.copy()
+            else:
+                adjusted_window_size_to_layers[accum_max_tokens].extend(layers)
+
+            remaining_layers -= set(layers)
+            prev_window_size = window_size
+
+        return adjusted_window_size_to_layers
+
+    def calculate_max_num_blocks_from_cpp(
+            self,
+            kv_cache_config: KvCacheConfigCpp,
+            model_config: ModelConfig,
+            extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
+        """
+        This function is a wrapper of KVCacheManagerCpp.calculate_max_num_blocks.
+        The final goal is to switch to the C++ implementation of calculate_max_num_blocks.
+        Currently, this function is added to support *ONLY* VSWA.
+
+        Args:
+            kv_cache_config: The KV cache configuration object.
+            model_config: The model configuration object.
+            extra_cost_memory: Extra memory in bytes to exclude from available memory.
+
+        Returns:
+            A dict of (max_attention_window, (blocks_in_primary_pool, blocks_in_secondary_pool)).
+        """
+
+        # VSWA on Torch backend has not supported the cross attention.
+        is_cross_attention = False
+        # check model config
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
+
+        # Construct WorldConfig from self.mapping
+        world_config_cpp = WorldConfig(
+            tensor_parallelism=self.mapping.tp_size,
+            pipeline_parallelism=self.mapping.pp_size,
+            rank=self.mapping.rank,
+            gpus_per_node=self.mapping.gpus_per_node)
+
+        window_size_to_layers = self._get_window_size_to_layers()
+        logger.debug(f"window_size_to_layers: {window_size_to_layers}")
+
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        primary_pool_memory_bytes = free_mem
+        secondary_pool_memory_bytes = 0
+        logger.debug(
+            f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
+            f"secondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
+        )
+
+        # Adjust the window sizes to fit the memory if even a single sequence
+        # cannot fit in the memory.
+        window_size_to_layers = self.adjust_window_sizes_for_vswa(
+            window_size_to_layers=window_size_to_layers,
+            model_config=model_config,
+            kv_cache_config=kv_cache_config,
+            pool_memory_bytes=primary_pool_memory_bytes,
+            kv_factor=self.kv_factor,
+            dtype=self.dtype,
+            is_cross_attention=is_cross_attention,
+        )
+
+        blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
+            config=kv_cache_config,
+            # TODO: support cross attention
+            is_cross_attention=is_cross_attention,
+            dtype=self.dtype,
+            model_config=model_config,
+            world_config=world_config_cpp,
+            window_size_to_layers=window_size_to_layers,
+            allotted_primary_mem_bytes=primary_pool_memory_bytes,
+            allotted_secondary_mem_bytes=secondary_pool_memory_bytes,
+            extra_cost_memory=extra_cost_memory,
+            kv_factor=self.kv_factor,
+        )
+        return blocks_per_window
+
+    def _validate_and_adjust_attention_windows(
+        self,
+        max_attention_window_vec: List[int],
+        blocks_per_window: BlocksPerWindow,
         tokens_per_block: int,
-        # Note that max_seq_len is not necessarily equal to kv_cache_config.num_tokens.
-        # It's derived from the model's BuildConfig for consistency with the C++ backend.
+        sink_token_length: int,
         max_seq_len: int,
-        max_batch_size: int,
-        mapping: Mapping,
-        dtype: DataType = DataType.HALF,
-        # Some speculative decoding methods need to use different kv lengths for the
-        # draft/target layers. Add extra tokens to haddle this issue.
-        num_extra_kv_tokens: int = 0
-    ) -> None:
-
-        # mamba hybrid cache requires block reuse to be disabled in KV cache config
-        assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
-
-        # initialize mamba cache manager
-        MambaCacheManager.__init__(self, mamba_d_model, mamba_d_state,
-                                   mamba_d_conv, mamba_expand, mamba_n_groups,
-                                   mamba_head_dim, mamba_num_layers,
-                                   max_batch_size, mapping,
-                                   mamba_conv1d_state_dtype)
-
-        # initialize kv cache manager
-        KVCacheManager.__init__(self,
-                                kv_cache_config,
-                                kv_cache_type,
-                                num_layers=num_layers,
-                                num_kv_heads=num_kv_heads,
-                                head_dim=head_dim,
-                                tokens_per_block=tokens_per_block,
-                                max_seq_len=max_seq_len,
-                                max_batch_size=max_batch_size,
-                                mapping=mapping,
-                                dtype=dtype,
-                                num_extra_kv_tokens=num_extra_kv_tokens)
-
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        self.prepare_mamba_resources(scheduled_batch)
-        super().prepare_resources(scheduled_batch)
-
-    def free_resources(self, request: LlmRequest):
-        self.free_mamba_resources(request)
-        super().free_resources(request)
-
-
-class BaseDraftTokenManager(BaseResourceManager):
-
-    @abstractmethod
-    def get_draft_tokens(self,
-                         input_token_ids: List[List[int]]) -> List[List[int]]:
+        max_beam_width: int,
+    ) -> Tuple[BlocksPerWindow, int, List[int]]:
         """
-        This method is intended to take a sequence of token ids (prompt + decoded so far)
-        and produce draft tokens for each request. We should have
-        len(get_draft_tokens(tokens)) == len(tokens), but each request's list of draft tokens
-        may be arbitrarily long.
+        Validate and adjust attention windows against their upper bounds if needed.
+        If there is no adjustment, the returned max_attention_window_vec will be the same as the input.
 
-        You can produce the draft tokens in any manner that you want.
+        Args:
+            max_attention_window_vec: List of attention window sizes
+            blocks_per_window: Dict mapping window size to (primary_blocks, secondary_blocks)
+            tokens_per_block: Number of tokens per block
+            sink_token_length: Length of sink tokens
+            max_seq_len: Maximum sequence length
+
+        Returns:
+            Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_max_attention_window_vec)
         """
+        window_adjustments = {}
+        # Validate each window size in blocks_per_window against its upper bound
+        for window_size, (blocks_in_primary_pool,
+                          _) in blocks_per_window.items():
+            upper_bound = self.get_max_atten_window_upper_bound(
+                blocks_in_primary_pool=blocks_in_primary_pool,
+                tokens_per_block=tokens_per_block,
+                max_beam_width=max_beam_width,
+                sink_token_len=sink_token_length,
+                max_seq_len=max_seq_len)
+            if window_size > upper_bound:
+                logger.warning(
+                    f"Attention window size {window_size} exceeds upper bound {upper_bound} "
+                    f"for available blocks. Reducing to {upper_bound}.")
+                window_adjustments[window_size] = upper_bound
+        # Apply adjustments to the window vector if any were needed
+        if window_adjustments:
+            adjusted_window_vec = [
+                window_adjustments.get(window, window)
+                for window in max_attention_window_vec
+            ]
+            logger.warning(
+                f"Adjusted max_attention_window_vec to {adjusted_window_vec}")
+            # update the window size in blocks_per_window if it is adjusted
+            adjusted_blocks_per_window = {}
+            for window_size, memory_pools in blocks_per_window.items():
+                if window_size in window_adjustments:
+                    adjusted_window_size = window_adjustments[window_size]
+                    adjusted_blocks_per_window[
+                        adjusted_window_size] = memory_pools
+                    logger.warning(
+                        f"Adjusted window size {window_size} to {adjusted_window_size} in blocks_per_window"
+                    )
+                else:
+                    adjusted_blocks_per_window[window_size] = memory_pools
+            # Update max_seq_len to the maximum of adjusted windows
+            adjusted_max_seq_len = max(adjusted_window_vec)
+            logger.warning(f"Adjusted max_seq_len to {adjusted_max_seq_len}")
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
-        input_tokens = []
-        for request in scheduled_batch.generation_requests:
-            input_tokens.append(request.get_tokens(0))
+            return adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_window_vec
+        else:
+            return blocks_per_window, max_seq_len, max_attention_window_vec
 
-        if not input_tokens:
-            return
-
-        results = self.get_draft_tokens(input_tokens)
-        for request, output in zip(scheduled_batch.generation_requests,
-                                   results):
-            request.py_draft_tokens = output
-
-    def get_max_resource_count(self) -> int:
-        return 0
-
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        return 0
+    def _set_temp_attention_window_inputs(
+            self) -> Optional[TempAttentionWindowInputs]:
+        """
+        Set up temp_attention_window_inputs for sliding window.
+        """
+        is_sliding_window = min(
+            self.max_attention_window_vec) < self.max_seq_len
+        if is_sliding_window:
+            temp_attention_window_inputs = TempAttentionWindowInputs()
+            temp_attention_window_inputs.paged_context_fmha = True
+            temp_attention_window_inputs.max_input_len = self.max_seq_len - 1
+            temp_attention_window_inputs.max_num_tokens = self.max_num_tokens
+            return temp_attention_window_inputs
+        else:
+            return None
 
 
 class SlotManager:
@@ -715,8 +1003,11 @@ class ResourceManager:
 
 class PeftCacheManager(BaseResourceManager):
 
-    def __init__(self, peft_cache_config: PeftCacheConfig,
-                 model_config: ModelConfig):
+    def __init__(self,
+                 peft_cache_config: PeftCacheConfig,
+                 lora_config: LoraConfig,
+                 model_config: ModelConfig,
+                 world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
@@ -735,8 +1026,8 @@ class PeftCacheManager(BaseResourceManager):
             lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
         )
 
-        # TODO smor- currently set manually, change that
-        world_config = _tb.WorldConfig()
+        if world_config is None:
+            world_config = _tb.WorldConfig()
 
         BufferManager = tensorrt_llm.bindings.internal.runtime.BufferManager
         buffer_manager = BufferManager(torch.cuda.current_stream().cuda_stream,
@@ -745,8 +1036,36 @@ class PeftCacheManager(BaseResourceManager):
                                         model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
+        self._lora_config = lora_config
+        self._lora_model_config = LoraModelConfig(
+            lora_config.lora_target_modules,
+            lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
+            binding_to_str_dtype(model_config.data_type))
+        self._lora_manager = LoraManager()
 
     def add_request_peft(self, request: LlmRequest):
+        if request.lora_task_id is not None:
+            is_task_cached = self.impl.is_task_cached(request.lora_task_id)
+            if is_task_cached:
+                # PeftCacheManager::addRequestPeft in CPP doesn't allow having only one of [config tensor, weights
+                # tensor] without the other. Since there's no need for any of them when the LoRA adapter is already
+                # cached, we can safely remove both from the request.
+                request.remove_lora_tensors()
+            elif request.lora_weights is None and request.py_lora_path:
+                self._lora_manager.load_from_ckpt(
+                    [request.py_lora_path],
+                    model_config=self._lora_model_config,
+                    runtime_mapping=None,
+                    uids=[request.lora_task_id],
+                    ckpt_source=self._lora_config.lora_ckpt_source)
+                request.lora_weights = self._lora_manager.cpp_lora_weights[
+                    request.lora_task_id]
+
+            # PeftCacheManager CPP implementation expects an extra dim at index 0
+            if request.lora_weights is not None:
+                request.lora_weights = request.lora_weights.unsqueeze(0)
+            if request.lora_config is not None:
+                request.lora_config = request.lora_config.unsqueeze(0)
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,
@@ -766,12 +1085,7 @@ class PeftCacheManager(BaseResourceManager):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
         for req in context_batch:
-            if req.lora_weights is not None and req.lora_config is not None:
-                req.lora_weights = req.lora_weights.reshape(
-                    [1] + list(req.lora_weights.shape))
-                req.lora_config = req.lora_config.reshape(
-                    [1] + list(req.lora_config.shape))
-            self.impl.add_request_peft(req, True)
+            self.add_request_peft(req)
 
         py_lora_task_layer_module_configs = self.impl.ensure_batch(
             context_batch, generation_batch, False)
@@ -789,7 +1103,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
-        pass
+        self.impl.mark_request_done(request)
 
     def shutdown(self):
         pass

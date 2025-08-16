@@ -23,10 +23,11 @@ import scipy
 import yaml
 
 import tensorrt_llm.evaluate
-from tensorrt_llm._torch import LLM as PyTorchLLM
-from tensorrt_llm._torch.speculative import SpecConfig
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -37,24 +38,32 @@ from ..conftest import llm_models_root
 from ..trt_test_alternative import check_call, exists
 
 
+def compute_theta(num_samples: int,
+                  sigma: float,
+                  alpha: float = 0.05,
+                  beta: float = 0.2):
+    scale = (2 * sigma**2 / num_samples)**0.5
+
+    # Single-tail testing
+    z_alpha = scipy.stats.norm.ppf(alpha)
+    z_beta = scipy.stats.norm.ppf(beta)
+    theta = -(z_alpha + z_beta) * scale
+    return theta
+
+
 def compute_threshold(num_samples: int,
                       ref_accuracy: float,
                       sigma: float,
                       alpha: float = 0.05,
-                      beta: float = 0.2,
                       higher_is_better: bool = True):
     scale = (2 * sigma**2 / num_samples)**0.5
 
     # Single-tail testing
     z_alpha = scipy.stats.norm.ppf(alpha)
     if higher_is_better:
-        threshold = ref_accuracy + z_alpha * scale
+        return ref_accuracy + z_alpha * scale
     else:
-        threshold = ref_accuracy - z_alpha * scale
-
-    z_beta = scipy.stats.norm.ppf(beta)
-    theta = -(z_alpha + z_beta) * scale
-    return threshold, theta
+        return ref_accuracy - z_alpha * scale
 
 
 class AccuracyTask:
@@ -82,7 +91,7 @@ class AccuracyTask:
 
     def __init__(self, model_name: str):
         with open(f"{self.REFERENCE_DIR}/{self.DATASET}.yaml") as f:
-            self.reference = yaml.safe_load(f)[model_name]
+            self.reference: List[dict] = yaml.safe_load(f).get(model_name, [])
 
     def get_num_samples_and_threshold(self, **acc_specs):
         """Get num_samples and threshold via accuracy specifications.
@@ -116,12 +125,12 @@ class AccuracyTask:
         sigma = entry.get("sigma", self.SIGMA)
         num_samples = entry.get("num_samples", self.NUM_SAMPLES)
         higher_is_better = entry.get("higher_is_better", self.HIGHER_IS_BETTER)
-        threshold, theta = compute_threshold(num_samples,
-                                             accuracy,
-                                             sigma=sigma,
-                                             alpha=alpha,
-                                             beta=beta,
-                                             higher_is_better=higher_is_better)
+        theta = compute_theta(num_samples, sigma=sigma, alpha=alpha, beta=beta)
+        threshold = compute_threshold(num_samples,
+                                      accuracy,
+                                      sigma=sigma,
+                                      alpha=alpha,
+                                      higher_is_better=higher_is_better)
         print("===========================================================\n"
               "= ACCURACY HYPOTHESIS TESTING\n"
               "===========================================================\n"
@@ -136,32 +145,48 @@ class AccuracyTask:
         return num_samples, threshold
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
                  extra_acc_spec: Optional[str] = None,
-                 extra_evaluator_kwargs: Optional[dict] = None):
+                 extra_evaluator_kwargs: Optional[dict] = None,
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
             spec_dec_algo = None
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
-        elif isinstance(llm.args.speculative_config, SpecConfig):
-            spec_dec_algo = llm.args.speculative_config.spec_dec_name
+            if spec_dec_algo == 'AUTO':
+                spec_dec_algo = 'NGram'
         else:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
             )
+        is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
 
-        num_samples, threshold = self.get_num_samples_and_threshold(
-            dtype=llm.args.dtype,
-            quant_algo=llm.args.quant_config.quant_algo,
-            kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
-            spec_dec_algo=spec_dec_algo,
-            extra_acc_spec=extra_acc_spec)
+        if is_integration_test:
+            num_samples = 1
+            logger.info(
+                "Running in INTEGRATION_TEST mode: using only 1 sample and skipping accuracy verification"
+            )
+            threshold = 0
+        else:
+            num_samples, threshold = self.get_num_samples_and_threshold(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=spec_dec_algo,
+                extra_acc_spec=extra_acc_spec)
 
-        sampling_params = SamplingParams(
-            max_tokens=self.MAX_OUTPUT_LEN,
-            truncate_prompt_tokens=self.MAX_INPUT_LEN)
+        if sampling_params is None:
+            sampling_params = SamplingParams(
+                max_tokens=self.MAX_OUTPUT_LEN,
+                truncate_prompt_tokens=self.MAX_INPUT_LEN)
+        else:
+            if sampling_params.max_tokens is None:
+                sampling_params.max_tokens = self.MAX_OUTPUT_LEN
+            if sampling_params.truncate_prompt_tokens is None:
+                sampling_params.truncate_prompt_tokens = self.MAX_INPUT_LEN
 
         evaluator_kwargs = {}
         if self.EVALUATOR_KWARGS is not None:
@@ -170,7 +195,11 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        accuracy = evaluator.evaluate(llm, sampling_params)
+        evaluate_kwargs = {}
+        if hasattr(self, 'EVALUATE_KWARGS'):
+            evaluate_kwargs.update(self.EVALUATE_KWARGS)
+        accuracy = evaluator.evaluate(llm, sampling_params, streaming,
+                                      **evaluate_kwargs)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
@@ -248,7 +277,7 @@ class MMLU(AccuracyTask):
     DATASET = "mmlu"
     DATASET_DIR = f"{llm_models_root()}/datasets/mmlu"
 
-    ALPHA = 0.01
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 4096
@@ -265,7 +294,7 @@ class GSM8K(AccuracyTask):
     DATASET = "gsm8k"
     DATASET_DIR = f"{llm_models_root()}/datasets/openai/gsm8k"
 
-    ALPHA = 0.02
+    ALPHA = 0.05
     BETA = 0.2
     SIGMA = 50
     NUM_SAMPLES = 1319  # Full sample
@@ -275,6 +304,8 @@ class GSM8K(AccuracyTask):
 
     EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+    EVALUATE_KWARGS = dict(scores_filter=None)
 
 
 class GPQADiamond(AccuracyTask):
@@ -291,6 +322,24 @@ class GPQADiamond(AccuracyTask):
 
     EVALUATOR_CLS = tensorrt_llm.evaluate.GPQADiamond
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+
+class JsonModeEval(AccuracyTask):
+    DATASET = "json_mode_eval"
+    DATASET_DIR = f"{llm_models_root()}/datasets/NousResearch/json-mode-eval"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 100  # Full sample
+
+    MAX_INPUT_LEN = 1024
+    MAX_OUTPUT_LEN = 512
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.JsonModeEval
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            apply_chat_template=True)
 
 
 class PassKeyRetrieval64k(AccuracyTask):
@@ -410,6 +459,9 @@ class CliFlowAccuracyTestHarness:
             f"--output_dir={self.ckpt_dir}",
             f"--dtype={self.dtype}",
         ]
+
+        if "nemotron_nas" in self.EXAMPLE_FOLDER:
+            convert_cmd.append("--trust_remote_code")
 
         if self.MODEL_FORMAT == "NEMO":
             convert_cmd.append(f"--nemo_ckpt_path={self.MODEL_PATH}")
@@ -658,26 +710,59 @@ class CliFlowAccuracyTestHarness:
             extra_build_args: Optional[list] = None,
             extra_summarize_args: Optional[list] = None,
             extra_eval_long_context_args: Optional[list] = None,
-            env: Optional[Dict[str, str]] = None):
-        self.install_requirements()
-        self.initialize_case(
-            tasks=tasks,
-            dtype=dtype,
-            quant_algo=quant_algo,
-            kv_cache_quant_algo=kv_cache_quant_algo,
-            spec_dec_algo=spec_dec_algo,
-            extra_acc_spec=extra_acc_spec,
-            tp_size=tp_size,
-            pp_size=pp_size,
-            cp_size=cp_size,
-            extra_convert_args=extra_convert_args,
-            extra_build_args=extra_build_args,
-            extra_summarize_args=extra_summarize_args,
-            extra_eval_long_context_args=extra_eval_long_context_args,
-            env=env)
-        self.convert()
-        self.build()
-        self.evaluate()
+            env: Optional[Dict[str, str]] = None,
+            timeout_manager=None):
+        """
+        Run all accuracy test phases with timeout management.
+        If timeout_manager is provided, each phase will be wrapped to track and deduct remaining timeout.
+        """
+        # Use timeout_manager to manage timeout for each phase
+        if timeout_manager is not None:
+            with timeout_manager.timed_operation("install_requirements"):
+                self.install_requirements()
+            with timeout_manager.timed_operation("initialize_case"):
+                self.initialize_case(
+                    tasks=tasks,
+                    dtype=dtype,
+                    quant_algo=quant_algo,
+                    kv_cache_quant_algo=kv_cache_quant_algo,
+                    spec_dec_algo=spec_dec_algo,
+                    extra_acc_spec=extra_acc_spec,
+                    tp_size=tp_size,
+                    pp_size=pp_size,
+                    cp_size=cp_size,
+                    extra_convert_args=extra_convert_args,
+                    extra_build_args=extra_build_args,
+                    extra_summarize_args=extra_summarize_args,
+                    extra_eval_long_context_args=extra_eval_long_context_args,
+                    env=env)
+            with timeout_manager.timed_operation("convert"):
+                self.convert()
+            with timeout_manager.timed_operation("build"):
+                self.build()
+            with timeout_manager.timed_operation("evaluate"):
+                self.evaluate()
+        else:
+            # fallback: no timeout management
+            self.install_requirements()
+            self.initialize_case(
+                tasks=tasks,
+                dtype=dtype,
+                quant_algo=quant_algo,
+                kv_cache_quant_algo=kv_cache_quant_algo,
+                spec_dec_algo=spec_dec_algo,
+                extra_acc_spec=extra_acc_spec,
+                tp_size=tp_size,
+                pp_size=pp_size,
+                cp_size=cp_size,
+                extra_convert_args=extra_convert_args,
+                extra_build_args=extra_build_args,
+                extra_summarize_args=extra_summarize_args,
+                extra_eval_long_context_args=extra_eval_long_context_args,
+                env=env)
+            self.convert()
+            self.build()
+            self.evaluate()
 
 
 class LlmapiAccuracyTestHarness:
@@ -692,3 +777,14 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+
+def get_accuracy_task(dataset_name: str):
+    try:
+        task_class = globals()[dataset_name]
+        if issubclass(task_class, AccuracyTask):
+            return task_class
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}.")
+    except KeyError:
+        raise ValueError(f"Not registered dataset: {dataset_name}.")
