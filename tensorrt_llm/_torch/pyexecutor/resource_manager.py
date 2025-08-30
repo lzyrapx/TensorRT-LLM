@@ -17,6 +17,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from .kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -161,6 +162,7 @@ class KVCacheManager(BaseResourceManager):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -177,6 +179,8 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        self.kv_connector_manager = kv_connector_manager
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -250,7 +254,7 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        self.is_vswa = len(self.max_attention_window_vec) > 1
+        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
         # Calculate blocks per window using appropriate method
         if self.is_vswa:
@@ -329,6 +333,7 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'kv_connector_manager': self.kv_connector_manager,
         }
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -413,7 +418,8 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
-                    if req.is_first_context_chunk:
+                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
+                            req):
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req)
@@ -422,10 +428,23 @@ class KVCacheManager(BaseResourceManager):
                         for _ in range(get_draft_token_length(req)):
                             self.impl.add_token(req.py_request_id)
 
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+
             for req in generation_batch:
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self)
+
+    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
+        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
+            request)
 
     def add_dummy_requests(
         self,
@@ -626,6 +645,9 @@ class KVCacheManager(BaseResourceManager):
             self.head_dim,
         )
 
+    def get_unique_primary_pool(self) -> torch.Tensor:
+        return self.impl.get_unique_primary_pool()
+
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         block_ids_per_seq_tensors = [
@@ -686,13 +708,14 @@ class KVCacheManager(BaseResourceManager):
     @staticmethod
     def adjust_window_sizes_for_vswa(
         window_size_to_layers: Dict[int, List[int]],
+        max_attention_window_vec: List[int],
         kv_cache_config: KvCacheConfigCpp,
         model_config: ModelConfig,
         pool_memory_bytes: int,
         kv_factor: int,
         dtype: DataType,
         is_cross_attention: bool = False,
-    ) -> Dict[int, List[int]]:
+    ) -> Tuple[Dict[int, List[int]], List[int]]:
 
         assert is_cross_attention is False, 'Cross attention is not supported'
 
@@ -717,7 +740,8 @@ class KVCacheManager(BaseResourceManager):
 
         if required_mem_bytes_per_seq < pool_memory_bytes:
             # No need to adjust the window sizes.
-            return copy.deepcopy(window_size_to_layers)
+            return (copy.deepcopy(window_size_to_layers),
+                    max_attention_window_vec)
 
         logger.debug(
             f'Adjusting the window sizes {list(window_size_to_layers)} to fit '
@@ -730,6 +754,8 @@ class KVCacheManager(BaseResourceManager):
 
         accum_max_tokens = 0
         prev_window_size = 0
+        adjusted_dict = {}
+        adjusted_max_attention_window_vec = max_attention_window_vec.copy()
 
         for window_size in sorted(window_size_to_layers):
             layers = window_size_to_layers[window_size]
@@ -773,11 +799,18 @@ class KVCacheManager(BaseResourceManager):
                 adjusted_window_size_to_layers[accum_max_tokens] = layers.copy()
             else:
                 adjusted_window_size_to_layers[accum_max_tokens].extend(layers)
+            adjusted_dict[window_size] = accum_max_tokens
+            # also update adjusted_max_attention_window_vec
+            adjusted_max_attention_window_vec = [
+                adjusted_dict.get(v, v)
+                for v in adjusted_max_attention_window_vec
+            ]
 
             remaining_layers -= set(layers)
             prev_window_size = window_size
 
-        return adjusted_window_size_to_layers
+        return (adjusted_window_size_to_layers,
+                adjusted_max_attention_window_vec)
 
     def calculate_max_num_blocks_from_cpp(
             self,
@@ -814,24 +847,29 @@ class KVCacheManager(BaseResourceManager):
         logger.debug(f"window_size_to_layers: {window_size_to_layers}")
 
         free_mem, total_mem = torch.cuda.mem_get_info()
-        primary_pool_memory_bytes = free_mem
-        secondary_pool_memory_bytes = 0
+        # Respect max_gpu_total_bytes if provided
+        free_gpu_memory_fraction = kv_cache_config.free_gpu_memory_fraction if kv_cache_config.free_gpu_memory_fraction else 0.9
+        self._primary_pool_memory_bytes = kv_cache_config.max_gpu_total_bytes if kv_cache_config.max_gpu_total_bytes > 0 else int(
+            free_mem * free_gpu_memory_fraction)
+        self._secondary_pool_memory_bytes = kv_cache_config.host_cache_size if kv_cache_config.host_cache_size else 0
         logger.debug(
-            f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
-            f"secondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
+            f"primary_pool_memory_bytes is set to {self._primary_pool_memory_bytes/1024**3}GB, \n"
+            f"secondary_pool_memory_bytes is set to {self._secondary_pool_memory_bytes/1024**3}GB"
         )
 
         # Adjust the window sizes to fit the memory if even a single sequence
         # cannot fit in the memory.
-        window_size_to_layers = self.adjust_window_sizes_for_vswa(
+        window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
             window_size_to_layers=window_size_to_layers,
+            max_attention_window_vec=self.max_attention_window_vec,
             model_config=model_config,
             kv_cache_config=kv_cache_config,
-            pool_memory_bytes=primary_pool_memory_bytes,
+            pool_memory_bytes=self._primary_pool_memory_bytes,
             kv_factor=self.kv_factor,
             dtype=self.dtype,
             is_cross_attention=is_cross_attention,
         )
+        self.max_attention_window_vec = max_attention_window_vec
 
         blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
             config=kv_cache_config,
@@ -841,8 +879,8 @@ class KVCacheManager(BaseResourceManager):
             model_config=model_config,
             world_config=world_config_cpp,
             window_size_to_layers=window_size_to_layers,
-            allotted_primary_mem_bytes=primary_pool_memory_bytes,
-            allotted_secondary_mem_bytes=secondary_pool_memory_bytes,
+            allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
+            allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
             extra_cost_memory=extra_cost_memory,
             kv_factor=self.kv_factor,
         )
@@ -1040,7 +1078,8 @@ class PeftCacheManager(BaseResourceManager):
         self._lora_model_config = LoraModelConfig(
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
-            binding_to_str_dtype(model_config.data_type))
+            binding_to_str_dtype(model_config.data_type),
+            lora_config.swap_gate_up_proj_lora_b_weight)
         self._lora_manager = LoraManager()
 
     def add_request_peft(self, request: LlmRequest):

@@ -7,7 +7,6 @@ import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
 import com.nvidia.bloom.CloudManager
-import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
@@ -45,8 +44,9 @@ DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 
-POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
-POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+POD_TIMEOUT_SECONDS_TEST = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
+POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+POD_TIMEOUT_SECONDS_SLURM = env.podTimeoutSeconds ? env.podTimeoutSeconds : "79200"  // Use 22 hours to allow for 2 hour of buffer.
 
 // Literals for easier access.
 @Field
@@ -65,7 +65,7 @@ def LLVM_CONFIG = "LLVM"
 LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
-def NANOBIND_CONFIG = "Nanobind"
+def PYBIND_CONFIG = "Pybind"
 
 @Field
 def BUILD_CONFIGS = [
@@ -74,7 +74,7 @@ def BUILD_CONFIGS = [
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
-  (NANOBIND_CONFIG) : [(TARNAME) : "nanobind-TensorRT-LLM.tar.gz"],
+  (PYBIND_CONFIG) : [(TARNAME) : "pybind-TensorRT-LLM.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -99,6 +99,8 @@ MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
+COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
@@ -113,7 +115,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results/results.xml"
-            def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
+            def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
             def downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
             if (downloadSucceed) {
                 sh "ls ${stageName}"
@@ -132,7 +134,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 }
 
 //TODO: consolidate slurm related code for both multi nodes and single nodes
-def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID){
+def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID, String slurmOutputFile) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
             ip           : cluster.ip,
@@ -143,20 +145,50 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
         ]
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-        pipeline.stage('Clean up SLURM Agent Resources') {
-            Utils.exec(
-                pipeline,
-                timeout: false,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID}"
-                )
-            )
+
+        def slurmJobID = Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"sed -n " +
+                "-e 's/.*Submitted batch job \\([0-9]\\+\\).*/\\1/p' " +
+                "-e 's/.*srun: job \\([0-9]\\+\\) queued.*/\\1/p' " +
+                "-e 's/.*srun: job \\([0-9]\\+\\) has been allocated.*/\\1/p' " +
+                "${slurmOutputFile} | tail -n1\""
+            ),
+            returnStdout: true
+        ).trim()
+
+        if (!slurmJobID || !slurmJobID.isNumber()) {
+            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"cat ${slurmOutputFile}\""))
+            error("Slurm job did not submit successfully. No job ID found.")
         }
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow slurm job termination; sleep 30")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
+            )
+        )
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID}"
+            )
+        )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
     }
 }
 
-def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
+def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, String slurmJobID) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
             ip           : cluster.ip,
@@ -167,17 +199,26 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
         ]
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-        pipeline.stage('Clean up SLURM Agent Resources') {
-            Utils.exec(
-                pipeline,
-                timeout: false,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
-                )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
-            Utils.exec(pipeline, script: "echo done")
-        }
+        )
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
+            )
+        )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
     }
 }
 
@@ -217,8 +258,13 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    def nodeName = "${cluster.host}-test-${UUID.randomUUID().toString()}"
-    def nodeSecret = CloudManager.createNode(nodeName)
+    // Create a unique suffix for the node name and workspace
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def nodeName = "${cluster.host}-test-${customSuffix}"
+    def customWorkspace = "/tmp/${nodeName}"
+    def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
+
+    def slurmJobID = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -239,42 +285,89 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
 
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3,)
 
-                Utils.exec(
+                Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
+
+                def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
-                            remote,
-                            """${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}"""
-                    )
+                        remote,
+                        "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}\""
+                    ),
+                    returnStdout: true
                 )
+
+                def jobIDs = slurmSubmitOutput
+                    .readLines()
+                    .collect { it.trim() }
+                    .collectMany { line ->
+                        def ids = []
+                        def m1 = (line =~ /Submitted batch job (\d+)/)
+                        if (m1) ids << m1[0][1]  // Extract the first captured group
+                        def m2 = (line =~ /srun: job (\d+) (queued|has been allocated)/)
+                        if (m2) ids << m2[0][1]  // Extract the first captured group
+                        return ids
+                    }
+
+                slurmJobID = jobIDs ? jobIDs[-1] : null
+
+                if (!slurmJobID || !slurmJobID.isNumber()) {
+                    error("Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}")
+                }
+                Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
             }
         }
 
         stage('Checking if the Node is Online') {
             def counter = 0
-            while (!CloudManager.isNodeOnline(nodeName) && counter < 12) {
-                sleep(time: 10, unit: 'MINUTES')  // Wait 10 minutes to check status of the node again
+            // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
+            // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
+            while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
+                // Wait 10 minutes to check status of the node again
+                sleep(time: 10, unit: 'MINUTES')
                 counter++
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+                node(nodeName) {
+                    sh """
+                        env | sort
+                        pwd && ls -alh
+                        ls -alh ${env.WORKSPACE}
+                        ls -alh ${env.WORKSPACE_TMP}
+                    """
+                }
+
+                def dockerArgs = "--gpus ${gpuCount} " +
+                    "--cap-add=SYS_ADMIN " +
+                    "--ipc=host " +
+                    "--security-opt seccomp=unconfined " +
+                    "-u root:root " +
+                    "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
+                    "-v /tmp/ccache:${CCACHE_DIR}:rw " +
+                    "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
+                    "--cap-add syslog"
 
                 if (partition.clusterName == "dlcluster") {
                     dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
                 }
-                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+
+                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
             } else {
-                echo "The node does not come online in 2 hours, terminating the job"
+                error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
         }
     } finally {
-        cleanUpNodeResources(pipeline, cluster, nodeName)
-        CloudManager.destroyNode(nodeName)
+        stage('Clean up SLURM Resources') {
+            Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
+            CloudManager.destroyNode(nodeName)
+            Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
+            cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
+        }
     }
 }
 
@@ -293,7 +386,13 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    def jobUID = "${cluster.host}-multi_node_test-${UUID.randomUUID().toString()}"
+    // Create a unique suffix for the job name
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
+
+    Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
+
+    def slurmOutputFile = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -319,7 +418,9 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
-            def scriptRunNode = "${jobWorkspace}/slurm_run.sh"
+            def scriptRunNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
+            def scriptLaunch = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
+            slurmOutputFile = "${jobWorkspace}/${jobUID}-slurm_output.log"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def isAarch64 = config.contains("aarch64")
@@ -327,7 +428,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
 
             stage('Prepare Testing') {
                 // Create Job Workspace folder in Frontend Node
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh -oStrictHostKeyChecking=no ${remote.user}@${remote.host} 'mkdir ${jobWorkspace}'",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host} 'mkdir -p ${jobWorkspace}'", numRetries: 3,)
 
                 // Download and Unzip Tar File
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
@@ -336,11 +437,13 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // Upload slurm_run_sh to Frontend node
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}",)
+
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}", numRetries: 3,)
+                Utils.exec(pipeline, script: "cat ${scriptRunLocalPath}")
 
                 // Upload waives.txt to Frontend node
                 def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}", numRetries: 3,)
 
                 // Generate Test List and Upload to Frontend Node
                 def makoArgs = getMakoArgsFromStageName(stageName, true)
@@ -349,7 +452,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 def testListPath = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}", numRetries: 3,)
 
                 // Generate Multi Node Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
@@ -369,7 +472,6 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ].join(" ")
 
-                def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
                 scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
@@ -389,27 +491,33 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export MODEL_CACHE_DIR=$MODEL_CACHE_DIR
                     export NVIDIA_IMEX_CHANNELS=0
                     chmod +x ${scriptRunNode}
-                    ${srunCmd}
+                    ${srunCmd} 2>&1 | tee ${slurmOutputFile}
                 """.stripIndent()
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}", numRetries: 3,)
+                Utils.exec(pipeline, script: "cat ${scriptLaunchDestPath}")
             }
+
             stage('Run Test') {
-                def scriptLaunch = "${jobWorkspace}/slurm_launch.sh"
                 Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        """bash ${scriptLaunch}"""
+                        "\"bash ${scriptLaunch}\""
                     )
                 )
             }
+
+            echo "Finished test stage execution."
         }
     } finally {
         uploadResults(pipeline, cluster, jobUID, stageName)
-        cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
+
+        stage('Clean up SLURM Resources') {
+            cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID, slurmOutputFile)
+        }
     }
 }
 
@@ -538,6 +646,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         } else {
             sh 'if [ "$(id -u)" -eq 0 ]; then dmesg; fi'
             if (noResultIfSuccess && !stageIsFailed) {
+                // Clean up the workspace
+                sh """
+                    env | sort
+                    pwd && ls -alh
+                    rm -rf ./*
+                """
+
+                echo "Finished test stage execution."
                 return
             }
             echo "noResultIfSuccess: ${noResultIfSuccess}, stageIsFailed: ${stageIsFailed}"
@@ -559,6 +675,15 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             )
             junit(testResults: "${stageName}/results*.xml")
         }
+
+        // Clean up the workspace
+        sh """
+            env | sort
+            pwd && ls -alh
+            rm -rf ./*
+        """
+
+        echo "Finished test stage execution."
     }
 }
 
@@ -601,7 +726,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_SLURM}]
                     tty: true
                     resources:
                       requests:
@@ -619,7 +744,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TMP}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_BUILD}]
                     volumeMounts:
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
@@ -644,8 +769,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
-        // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
-        if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
+        if (hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
             memorySize = "${gpuCount * 150}" + "Gi"
@@ -659,7 +783,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
+        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type.contains("rtx-pro-6000") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -686,7 +810,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TEST}]
                     tty: true
                     resources:
                       requests:
@@ -795,7 +919,7 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def runLLMDocBuild(pipeline, config)
 {
-    // Step 1: cloning tekit source code
+    // Step 1: cloning source code
     sh "pwd && ls -alh"
     sh "env | sort"
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -1089,7 +1213,7 @@ def getSSHConnectionPorts(portConfigFile, stageName)
         usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
         string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
         ]) {
-        portUsage = sh(script: "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'netstat -tuln'",returnStdout: true)
+        portUsage = sh(script: "ssh -v ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'netstat -tuln'", returnStdout: true)
     }
     echo "Port Usage: ${portUsage}"
 
@@ -1240,15 +1364,18 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
-    // Step 1: create LLM_ROOT dir
-    sh "pwd && ls -alh"
-    // TODO: proper way to clean workspace, maybe save in a folder named with BUILD_ID.
-    // So that it can work with multiple job running in same node
-    sh "rm -rf ./*"
+    // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
-    sh "mkdir ${llmRootConfig}"
+    sh """
+        env | sort
+        pwd && ls -alh
+        rm -rf ./*
+        mkdir ${llmRootConfig}
+        ls -alh ${env.WORKSPACE}
+        ls -alh ${env.WORKSPACE_TMP}
+    """
 
-    def llmPath = sh (script: "realpath ${llmRootConfig}",returnStdout: true).trim()
+    def llmPath = sh (script: "realpath ${llmRootConfig}", returnStdout: true).trim()
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
     echoNodeAndGpuInfo(pipeline, stageName)
 
@@ -1268,6 +1395,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
         sh "nvidia-smi -q"
+        sh "nvidia-smi topo -m"
         sh "df -h"
 
         // setup HF_HOME to cache model and datasets
@@ -1362,9 +1490,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
                 string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
                 ]) {
-                sh "sshpass -p ${PASSWORD} -v ssh ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_rsa.pub"
-                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'echo \"\" > ~/.ssh/known_hosts && cat ~/.ssh/id_rsa.pub' >> ~/.ssh/authorized_keys"
-                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat ~/.ssh/ports_config.txt' >> ${portConfigFilePath}"
+                sh "sshpass -p ${PASSWORD} -v ssh ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_rsa.pub"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'echo \"\" > ~/.ssh/known_hosts && cat ~/.ssh/id_rsa.pub' >> ~/.ssh/authorized_keys"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'cat ~/.ssh/ports_config.txt' >> ${portConfigFilePath}"
 
                 def (int userPort, int monitorPort) = getSSHConnectionPorts(portConfigFilePath, stageName)
                 if (userPort == 0) {
@@ -1373,7 +1501,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     return
                 }
 
-                sh "ssh -f -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -L 1111:127.0.0.1:${monitorPort} -R ${monitorPort}:127.0.0.1:1112 -NR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
+                sh "ssh -f ${COMMON_SSH_OPTIONS} -L 1111:127.0.0.1:${monitorPort} -R ${monitorPort}:127.0.0.1:1112 -NR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
                 sh "autossh -fNR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
                 sh "ps aux | grep ssh"
                 try {
@@ -1763,7 +1891,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
-        "DGX_H100-4_GPUs-Triton-Post-Merge-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 1],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
@@ -1773,7 +1900,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
         "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
-        "A10-Nanobind": ["a10", "l0_a10_nanobind", 1, 1],
+        "A10-Pybind": ["a10", "l0_a10_pybind", 1, 1],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
@@ -1790,11 +1917,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
-        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
-        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
-        "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
-        "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -1833,13 +1957,20 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
         "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
         "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
+        "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
+        "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
+        "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
+        "RTXPro6000-Pytorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
@@ -1850,15 +1981,17 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        if (key.contains("Nanobind")) {
-            config = NANOBIND_CONFIG
+        if (key.contains("Pybind")) {
+            config = PYBIND_CONFIG
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
-        "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
+        "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
@@ -1879,25 +2012,28 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
-        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 2],
-        "GH200-TensorRT-Post-Merge-2": ["gh200", "l0_gh200", 2, 2],
+        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
     ]
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200", 1, 1, 4],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200", 1, 1, 4],
+        "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 1],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 6, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -2075,11 +2211,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 checkPipStage = true
             }
 
-            if (cpu_arch == AARCH64_TRIPLE && values[5] != DLFW_IMAGE) {
-                checkPipStage = false
-                echo "Skip pip install sanity check due to https://nvbugs/5453827"
-            }
-
             if (checkPipStage) {
                 stage("Run LLMAPI tests") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
@@ -2121,8 +2252,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         }
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
+                            // Retry 2 times if timeout occurs.
                             sh "env | sort"
-                            checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                            trtllm_utils.llmRetry(1, "checkPipInstall", {
+                                timeout(time: 30, unit: 'MINUTES') {
+                                    checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                                }
+                            })
                         }
                         echo "###### Run LLMAPI tests Start ######"
                         def config = VANILLA_CONFIG
@@ -2457,7 +2593,7 @@ pipeline {
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSigns = ["DGX_H100", "DGX_H200", "GB200", "DGX_B200"]
+                        def dgxSigns = ["2_GPUs", "4_GPUs", "8_GPUs"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
