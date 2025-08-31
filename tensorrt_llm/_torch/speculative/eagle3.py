@@ -179,12 +179,54 @@ class Eagle3SpecMetadata(SpecMetadata):
                 break
 
     def get_hidden_states(self):
+        """
+        假设场景：一个文本生成模型，首轮生成10个token，第二轮继续生成5个token
+        # 假设初始设置
+        self.hidden_size = 768  # 隐藏层维度
+        self.num_tokens = 10    # 首轮要处理的token数量
+        self.is_first_draft = True  # 首轮生成
+
+        # eagle3_resource_manager.hidden_states 是一个形状为 [100, 1024] 的数组
+        # 表示有100个token的隐藏状态，每个隐藏状态有1024维
+
+        # hidden_states_read_indices 可能是 [5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        # 表示我们要读取第5到14个token的隐藏状态
+
+        # 第一轮调用 get_hidden_states()
+        hidden_states = self.eagle3_resource_manager.hidden_states[
+            [5, 6, 7, 8, 9, 10, 11, 12, 13, 14], :]  # 获取10个token的完整隐藏状态(1024维)
+
+        # 因为 is_first_draft = True，不执行切片操作
+        # 返回的形状是 [10, 1024]
+
+        # 第二轮生成
+        self.num_tokens = 5     # 这轮处理5个token
+        self.is_first_draft = False  # 不是首轮
+
+        # hidden_states_read_indices 可能是 [15, 16, 17, 18, 19]
+        hidden_states = self.eagle3_resource_manager.hidden_states[
+            [15, 16, 17, 18, 19], :]  # 获取5个token的完整隐藏状态(1024维)
+
+        # 因为不是首轮，执行切片操作，只保留前768维
+        hidden_states = hidden_states[:, :768]  # 形状变为 [5, 768]
+        """
+        # 从 eagle3_resource_manager 的 hidden_states 数组中读取隐藏状态
+        # 使用 hidden_states_read_indices 的前 num_tokens 个索引来选择特定的行（token）
+        # 这样做的目的是只获取当前需要处理的token对应的隐藏状态
         hidden_states = self.eagle3_resource_manager.hidden_states[
             self.hidden_states_read_indices[:self.num_tokens], :]
+        # 检查是否不是首轮草稿生成
+        # 在某些多轮生成场景中，首轮生成可能需要完整的隐藏状态，而后续轮次可能只需要部分       
         if not self.is_first_draft:
+            # hidden_states[:, :self.hidden_size] 表示：
+            # 第一个维度（行）: 表示选择所有行
+            # 第二个维度（列）:self.hidden_size 表示选择前 self.hidden_size 列（索引 0 到 self.hidden_size-1）
+            
+            # 所以这个含义是指：保留所有token（所有行），但只保留每个token的前self.hidden_size个特征维度（列）
             hidden_states = hidden_states[:, :self.hidden_size]
+            
+        # 返回处理后的隐藏状态张量
         return hidden_states
-
 
 @dataclass
 class Eagle3OneModelSpecMetadata(SpecMetadata):

@@ -313,13 +313,26 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         not work with CUDA graphs. So we have hoisted this logic out
         of the forward pass - the pyexecutor will call this function
         before running forward when applicable.
+        
+        针对Eagle3模型的特殊处理逻辑。
+        首次通过草案模型时，可能需要通过矩阵乘法降低隐藏状态的维度。
+        由于CUDA图不支持基于形状的动态控制流，我们将此逻辑提取到前向传播之外，
+        由Python执行器在运行前向传播前调用此函数（当适用时）。
         """
+        # 将隐藏状态转换为模型指定的数据类型，确保计算一致性
         hidden_states = hidden_states.to(self.model.dtype)
-
+        
+        # 获取模型期望的隐藏状态维度大小
         expected_hidden_size = self.model.hidden_size
+        
+        # 检查当前隐藏状态的最后一个维度是否与模型期望的维度匹配
+        # hidden_states.shape[-1] 表示张量的最后一个维度（通常是特征维度）
+        # 例如，如果hidden_states的形状为 [batch_size, seq_len, feature_dim]
+        # 那么hidden_states.shape[-1] 就是 feature_dim
         if hidden_states.shape[-1] != expected_hidden_size:
+            # 如果维度不匹配，使用全连接层进行投影变换，使其匹配模型期望的维度
             hidden_states = self.model.fc(hidden_states)
-
+        # 返回处理后的隐藏状态
         return hidden_states
 
 
