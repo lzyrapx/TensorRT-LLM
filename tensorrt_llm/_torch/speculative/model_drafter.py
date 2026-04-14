@@ -369,13 +369,14 @@ class ModelDrafter(Drafter):
         """Update request states after processing."""
         """处理完成后更新请求状态。"""
         for request in scheduled_requests.context_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                request.move_to_next_context_chunk()
-            if request.context_remaining_length == 0:
-                request.state = LlmRequestState.GENERATION_IN_PROGRESS
+            if request.state != LlmRequestState.GENERATION_COMPLETE:  # generation phase 完成
+                request.move_to_next_context_chunk()  # 移动到下一个上下文块
+            if request.context_remaining_length == 0:  # context phase 完成
+                request.state = LlmRequestState.GENERATION_IN_PROGRESS  # # 切换到 generation phase 进行中状态
 
     def _update_requests(self, sample_state: SampleState) -> None:
         """Update requests with sample state."""
+        """使用采样状态更新请求。"""
         if self.sampler is not None:
             self.sampler.update_requests(sample_state)
 
@@ -383,24 +384,28 @@ class ModelDrafter(Drafter):
             self, draft_batch: ScheduledRequests,
             req_id_to_old_request: Dict[int, LlmRequest]) -> List[LlmRequest]:
         """Process decoded tokens and determine which requests to continue processing."""
+        """处理解码的令牌并确定需要继续处理的请求。"""
         new_requests = []
         for req in draft_batch.all_requests():
             target_model_req = req_id_to_old_request[req.py_request_id]
             if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 # This is a chunked prefill request and we have more prefill chunks
                 # to process. Defer adding draft tokens until the whole prompt is processed.
+                # 这是分块预填充请求，还有更多预填充块要处理
+                # 推迟添加草案令牌直到整个提示处理完成
                 self.draft_seq_slot_manager.free_resources(req)
                 continue
-
+            # 将草案令牌添加到目标请求
             target_model_req.py_draft_tokens.append(req.get_last_tokens(0))
             if self._request_draft_logits:
                 target_model_req.py_draft_logits = req.py_result.generation_logits
+            # 如果请求未完成且还有空间，继续处理
             if req.state != LlmRequestState.GENERATION_COMPLETE and len(
                     target_model_req.py_draft_tokens
             ) < target_model_req.py_draft_pages_allocated:
                 new_requests.append(req)
             else:
-                self.draft_seq_slot_manager.free_resources(req)
+                self.draft_seq_slot_manager.free_resources(req)   # 释放资源
 
         return new_requests
 
@@ -408,16 +413,24 @@ class ModelDrafter(Drafter):
                                 scheduled_batch: ScheduledRequests,
                                 logits: torch.Tensor,
                                 d2t: Optional[torch.Tensor] = None):
+        """执行引导式解码（如果配置了的话）。"""
         if self.guided_decoder is not None:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits, d2t=d2t)
 
-    @nvtx_range("prepare_draft_tokens")
+    @nvtx_range("prepare_draft_tokens")  # NVTX性能分析范围
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
+        """
+        为调度请求准备draft token。
+
+        参数:
+            scheduled_requests: 本次迭代的调度请求
+            resource_manager: 本次迭代的资源管理器
+        """
         """
         Prepare draft tokens for the scheduled requests.
 
@@ -432,48 +445,63 @@ class ModelDrafter(Drafter):
             raise ValueError("Resource manager is required")
 
         try:
+             # 准备 draft 批次
             draft_batch = self._prepare_draft_batch(scheduled_requests)
 
             if draft_batch.batch_size == 0:
                 return
-
+            
+            # 准备资源
             self.draft_seq_slot_manager.prepare_resources(draft_batch)
 
+            # 创建请求ID到原始请求的映射
             req_id_to_old_request = {
                 req.py_request_id: req
                 for req in scheduled_requests.all_requests()
             }
 
             # Initial forward pass
+            # 初始前向传播
             outputs = self._forward_draft_model(draft_batch, resource_manager)
+            # 执行引导式解码
             self._execute_guided_decoder(draft_batch,
                                          outputs['logits'],
                                          d2t=outputs.get('d2t'))
+            # 异步采样
             sample_state = self._sample_async(draft_batch, outputs)
             previous_batch = sample_state
-
+            
+            # 处理完成后更新请求状态
             self._update_request_states(draft_batch)
 
             # Convert context requests to generation requests
+            # 将 context 请求转换为 generation 请求
             draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
             draft_batch.context_requests = []
 
             # Generate remaining draft tokens iteratively
+            # 迭代生成剩余的 draft token
             for i in range(self.max_draft_tokens - 1):
-                if len(draft_batch.generation_requests) == 0:
+                if len(draft_batch.generation_requests) == 0: # 没有 generation request
                     break
-
+                
+                # 执行 draft 模型的 forward
                 outputs = self._forward_draft_model(draft_batch,
                                                     resource_manager,
                                                     previous_batch)
                 if previous_batch is not None:
+                    # 更新 request
                     self._update_requests(previous_batch)
+                # 执行 guide decoder
                 self._execute_guided_decoder(draft_batch,
                                              outputs['logits'],
                                              d2t=outputs.get('d2t'))
+                # 异步采样
                 sample_state = self._sample_async(draft_batch, outputs)
+                # 更新 request 状态
                 self._update_request_states(draft_batch)
                 if previous_batch is not None:
+                    # 处理 decoded token
                     new_requests = self._process_decoded_tokens(
                         previous_batch.scheduled_requests,
                         req_id_to_old_request)
@@ -483,12 +511,14 @@ class ModelDrafter(Drafter):
                 previous_batch = sample_state
 
             # Final cleanup
+            # 最后清理资源
             if previous_batch is not None:
                 self._update_requests(previous_batch)
                 self._process_decoded_tokens(previous_batch.scheduled_requests,
                                              req_id_to_old_request)
 
             if self.guided_decoder is not None:
+                # 回滚 draft tokens
                 self.guided_decoder.rollback_draft_tokens(scheduled_requests)
 
         except Exception as e:

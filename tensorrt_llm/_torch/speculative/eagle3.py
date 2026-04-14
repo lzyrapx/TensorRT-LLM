@@ -17,6 +17,11 @@ from .mtp import MTPSampler
 
 class Eagle3ResourceManager(BaseResourceManager):
     """
+    Eagle3 资源管理器，用于管理草稿模型的隐藏状态。
+    当使用 Eagle3TwoModel 时，会有两个模型引擎：目标模型和草稿模型。
+    此类负责管理草稿模型的隐藏状态存储和检索。
+    """
+    """
     Eagle3 needs to save the hidden states for the draft model. When using
     Eagle3TwoModel, there will be two model engines, one for the target model
     and one for the draft model. Use this class to manage the hidden states.
@@ -26,54 +31,98 @@ class Eagle3ResourceManager(BaseResourceManager):
                  hidden_size: int, max_num_requests: int, max_seq_len: int,
                  max_num_tokens: int):
         self.dtype = dtype
-        self.max_draft_len = config.max_draft_len
+        self.max_draft_len = config.max_draft_len   # 最大草稿生成长度
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
-        self.slot_manager = SlotManager(max_num_requests)
+        self.slot_manager = SlotManager(max_num_requests)  # 槽位管理器
 
         # empty hidden states tensor
+       
+        # 最大的 token 数量
         max_num_tokens = min(max_num_tokens,
                              max_num_requests * self.max_seq_len)
+         # 创建空的隐藏状态张量
         self.hidden_states = torch.empty(
             (max_num_tokens, self.hidden_size * config.num_capture_layers),
             dtype=self.dtype,
             device='cuda')
+        
         # sequence length, only used for metadata preparation
+        # 序列长度，仅用于元数据准备
         self.seq_lens = {i: 0 for i in range(max_num_requests)}
         # start indices of each slot
+        # 每个槽位的起始索引
         self.start_indices = {i: 0 for i in range(max_num_requests)}
         # whether the next draft forward is the first
+        # 标记下一个draft前向传播是否是第一次
         self.is_first_draft = True
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
+        """
+        准备资源，为新的请求分配隐藏状态张量并更新槽位ID。
+
+        参数:
+            scheduled_batch: 已调度的请求批次
+        """
         # allocate hidden state tensors and update slot ids
+        # 分配隐藏状态张量并更新槽位ID
         self.slot_ids = []
         for req in context_batch:
-            if req.is_first_context_chunk:
+            if req.is_first_context_chunk:  # 如果是第一个 context 块
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 self.slot_ids.append(slot_id)
         # reset the flag before model forward
+        # 在模型前向传播前重置标志
         self.is_first_draft = True
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
+        """更新资源（当前为空实现）"""
         pass
 
     def free_resources(self, request: LlmRequest):
+        """
+        释放请求占用的资源。
+
+        参数:
+            request: 要释放的LLM请求
+        """
         self.slot_manager.remove_slot(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
+        """
+        添加虚拟请求。
+
+        参数:
+            request_ids: 请求ID列表
+        """
         for rid in request_ids:
             self.slot_manager.add_slot(rid)
 
     def shutdown(self):
+        """关闭资源管理器"""
         pass
 
     def get_max_resource_count(self) -> int:
+        """
+        获取最大资源数量。
+
+        返回:
+            最大请求数量
+        """        
         return self.max_num_requests
 
     def get_needed_resource_to_completion(self, request: LlmRequest):
+        """
+        获取请求完成所需的资源（当前返回0）。
+
+        参数:
+            request: LLM请求
+
+        返回:
+            所需的资源数量
+        """
         return 0
 
 
